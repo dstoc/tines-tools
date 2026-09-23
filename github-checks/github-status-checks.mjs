@@ -324,6 +324,18 @@ async function main() {
   const action = ACTIONS[result.result];
   if (!currentIssue.allowed_transitions?.some((t) => t.name === action))
     throw new Error(`Transition '${action}' no longer available; report attached but issue unchanged`);
+  if (result.result === 'passed' || result.result === 'failed') {
+    const status = result.result.toUpperCase();
+    const message = `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}`;
+    try {
+      // --json precedes positional arguments: the comment CLI passes through trailing options.
+      await jsonCommand('tines', ['issues', 'comment', '--json', ref, message]);
+      say(`Commented: ${message}`);
+    } catch (error) {
+      // A failed comment must not prevent the issue from taking its workflow transition.
+      say(`Warning: could not post status comment: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   await tines('issues', 'move', ref, action);
   say(`${ref}: ${action} (${result.reason})`);
 }

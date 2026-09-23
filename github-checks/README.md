@@ -25,7 +25,7 @@ The Tines daemon substitutes and shell-quotes the placeholders, sets `TINES_API_
 1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status and HEAD SHA.
 2. Wait for checks to register and complete using `gh pr checks --watch`, then fetch structured results. Optionally restrict to required checks and/or require specific check names.
 3. Re-check the PR's HEAD and artifact version to avoid publishing a result for a superseded PR.
-4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`, then take exactly one transition. If attaching the report fails or the issue moved to another state, the runner exits non-zero **without taking a transition**.
+4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`. For `passed` or `failed`, post a Tines issue comment containing the result, PR number and full HEAD SHA (for example, `Status checks PASSED for PR #163 at 579c27ba1becaa111e3b44dc5193cb59efb4db3e`). Then take exactly one transition. If attaching the report fails or the issue moved to another state, the runner exits non-zero **without commenting or transitioning**. Comment failures are logged but do not block the transition. Infrastructure failures do not generate a status comment.
 
 | Result | Transition | Meaning |
 | --- | --- | --- |
