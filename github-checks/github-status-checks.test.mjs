@@ -24,6 +24,9 @@ if (a[0] === 'issues' && a[1] === 'show') {
 } else if (event === 'issues artifacts attach') {
   if (process.env.MOCK_CASE === 'attach_fail') { console.error('forced attach failure'); process.exit(1); }
   console.log(JSON.stringify({ artifact_type: 'file', name: 'github-status-checks' }));
+} else if (a[0] === 'issues' && a[1] === 'comment') {
+  if (process.env.MOCK_CASE === 'comment_fail') { console.error('forced comment failure'); process.exit(1); }
+  console.log(JSON.stringify({ id: 'comment-123', body: a[3] }));
 } else if (a[0] === 'issues' && a[1] === 'move') {
   console.log(JSON.stringify({ state: { name: a[3] } }));
 } else { console.error('unexpected tines command:', a); process.exit(3); }
@@ -110,15 +113,35 @@ for (const [mode, status, action, reason] of [
     const move = events.findIndex((e) => e.binary === 'tines' && e.args.slice(0, 2).join(' ') === 'issues move');
     assert.ok(attach >= 0 && move > attach, 'report attached before transition');
     assert.equal(events[move].args[3], action);
+    const comment = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'comment');
+    if (mode === 'passed' || mode === 'failed' || mode === 'watch_pending') {
+      assert.ok(comment > attach && comment < move, 'comment after report and before transition');
+      assert.equal(events[comment].args[2], 'demo/4');
+      assert.equal(events[comment].args[3],
+        `Status checks ${status.toUpperCase()} for PR #123 at ${sha}`);
+    } else {
+      assert.equal(comment, -1, 'do not comment on infrastructure failures');
+    }
     if (mode === 'watch_pending') assert.ok(events.some((e) => e.binary === 'gh' && e.args.includes('--watch')));
   });
 }
+
+test('comment failure logs warning but still transitions', async () => {
+  const { result, report, events } = await simulate('comment_fail');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'passed');
+  assert.match(result.stdout, /Warning: could not post status comment/);
+  const comment = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'comment');
+  const move = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'move');
+  assert.ok(comment !== -1 && move > comment);
+});
 
 test('attachment failure prevents transition', async () => {
   const { result, report, events } = await simulate('attach_fail');
   assert.equal(result.status, 1);
   assert.equal(report.result, 'passed');
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'comment'));
 });
 
 test('concurrent issue state change prevents transition', async () => {
@@ -127,4 +150,5 @@ test('concurrent issue state change prevents transition', async () => {
   assert.equal(report.result, 'passed');
   assert.ok(events.some((e) => e.binary === 'tines' && e.args[2] === 'attach'));
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'comment'));
 });
