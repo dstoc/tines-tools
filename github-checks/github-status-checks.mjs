@@ -1,0 +1,334 @@
+#!/usr/bin/env node
+// Dependency-free Tines custom harness. Requires Node.js 20+, tines CLI, and gh CLI.
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+
+const ACTIONS = {
+  passed: 'Checks passed',
+  failed: 'Checks failed',
+  infrastructure_failed: 'Infrastructure failed',
+};
+const CHECK_FIELDS = 'name,workflow,state,bucket,link,startedAt,completedAt';
+const INFRA_STATES = new Set([
+  'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE', 'STALE', 'ACTION_REQUIRED', 'ERROR',
+]);
+const number = (name, fallback, min, max) => {
+  const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
+  if (!Number.isFinite(value) || value < min || value > max)
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  return value;
+};
+const say = (message) => console.log(`[github-status-checks] ${message}`);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+class OperationalError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+async function command(binary, args, { timeoutMs = 30_000, stream = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, {
+      env: { ...process.env, GH_PROMPT_DISABLED: '1', CI: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const cap = (previous, chunk) => (previous + chunk.toString()).slice(-65_536);
+    child.stdout.on('data', (chunk) => {
+      stdout = cap(stdout, chunk);
+      if (stream) process.stdout.write(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = cap(stderr, chunk);
+      if (stream) process.stderr.write(chunk);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
+    }, Math.max(1, timeoutMs));
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(new OperationalError('command_error', `${binary}: ${error.message}`));
+    });
+    child.once('close', (exitCode, signal) => {
+      clearTimeout(timer);
+      resolve({ stdout, stderr, exitCode, signal, timedOut });
+    });
+  });
+}
+
+async function jsonCommand(binary, args, options) {
+  const result = await command(binary, args, options);
+  if (result.timedOut)
+    throw new OperationalError('command_timeout', `${binary} timed out: ${args.slice(0, 3).join(' ')}`);
+  if (result.exitCode !== 0)
+    throw new OperationalError('command_failed', `${binary} ${args.slice(0, 3).join(' ')}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new OperationalError('invalid_json', `${binary} returned invalid JSON`);
+  }
+}
+
+const tines = (...args) => jsonCommand('tines', [...args, '--json']);
+
+function argsFromCli(argv) {
+  const options = {};
+  for (let i = 0; i < argv.length; i++) {
+    const key = argv[i];
+    if (!['--prompt', '--issue', '--workspace'].includes(key) || !argv[i + 1])
+      throw new Error('Usage: github-status-checks.mjs --prompt <prompt.md> --workspace <dir> [--issue <project/number>]');
+    options[key.slice(2)] = argv[++i];
+  }
+  if (!options.issue && !options.prompt)
+    throw new Error('Pass --prompt <prompt.md> or --issue <project/number>');
+  return options;
+}
+
+async function issueRef(options) {
+  if (options.issue) {
+    if (!/^[^\s/]+\/\d+$/.test(options.issue)) throw new Error('Invalid --issue reference');
+    return options.issue;
+  }
+  const prompt = await readFile(options.prompt, 'utf8');
+  const match = prompt.match(/This is run [^\n]+ for issue ([^\s;]+\/\d+);/);
+  if (!match) throw new Error('Cannot extract issue ref from the Tines supervisor preamble');
+  return match[1];
+}
+
+function normalizeRepo(url) {
+  if (typeof url !== 'string') return null;
+  const ssh = url.match(/^git@github\.com:([\w.-]+)\/([\w.-]+?)(?:\.git)?$/i);
+  if (ssh) return `${ssh[1]}/${ssh[2]}`.toLowerCase();
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== 'github.com' ||
+      !['https:', 'ssh:'].includes(parsed.protocol) || parsed.search || parsed.hash) return null;
+    const match = parsed.pathname.match(/^\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i);
+    return match ? `${match[1]}/${match[2]}`.toLowerCase() : null;
+  } catch { return null; }
+}
+
+async function allowedRepos(workspace) {
+  if (!workspace) return [];
+  let repos;
+  try { repos = JSON.parse(await readFile(join(workspace, 'repos.json'), 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw new OperationalError('repos_invalid', `Cannot parse repos.json: ${error.message}`);
+  }
+  if (!Array.isArray(repos)) throw new OperationalError('repos_invalid', 'repos.json must be an array');
+  return repos.map((r) => normalizeRepo(r?.url)).filter(Boolean);
+}
+
+function prFromArtifacts(items, preferredName) {
+  const named = items.find((a) => a.name === preferredName);
+  const candidates = items.filter((a) => a.artifact_type === 'pr');
+  const artifact = named ?? (candidates.length === 1 ? candidates[0] : null);
+  if (!artifact)
+    throw new OperationalError('pr_artifact_missing', `Expected PR artifact '${preferredName}' (found ${candidates.length} PR artifacts)`);
+  if (artifact.artifact_type !== 'pr')
+    throw new OperationalError('pr_artifact_invalid', `Artifact '${artifact.name}' is ${artifact.artifact_type}, not pr`);
+  const version = artifact.current_version;
+  const repo = normalizeRepo(version?.pr_repo_url);
+  const number = version?.pr_number;
+  if (!repo || !Number.isSafeInteger(number) || number <= 0)
+    throw new OperationalError('pr_artifact_invalid', `Artifact '${artifact.name}' has an invalid GitHub repository or PR number`);
+  return { repo, number, artifact_name: artifact.name, artifact_version: version.version,
+    url: `https://github.com/${repo}/pull/${number}` };
+}
+
+async function prView(pr) {
+  const result = await jsonCommand('gh', [
+    'pr', 'view', String(pr.number), '--repo', pr.repo,
+    '--json', 'number,url,state,isDraft,headRefOid,baseRefName',
+  ]);
+  if (result.number !== pr.number || result.url?.toLowerCase() !== pr.url.toLowerCase() ||
+      !/^[0-9a-f]{40,64}$/i.test(result.headRefOid ?? ''))
+    throw new OperationalError('pr_mismatch', 'GitHub returned an unexpected PR or invalid HEAD');
+  if (result.state !== 'OPEN' || result.isDraft)
+    throw new OperationalError('pr_not_ready', `PR must be open and not draft (state=${result.state}, draft=${result.isDraft})`);
+  return result;
+}
+
+async function checks(pr, required) {
+  const args = ['pr', 'checks', String(pr.number), '--repo', pr.repo,
+    '--json', CHECK_FIELDS, ...(required ? ['--required'] : [])];
+  const result = await command('gh', args);
+  if (result.timedOut)
+    throw new OperationalError('checks_timeout', 'Timed out fetching GitHub checks');
+  // gh exits nonzero when checks fail (1) or are pending (8), even with JSON output.
+  // With no checks, some versions of gh emit only a diagnostic on stderr.
+  if (result.exitCode === 1 && !result.stdout.trim() &&
+      /no checks reported/i.test(result.stderr)) return [];
+  if (![0, 1, 8].includes(result.exitCode))
+    throw new OperationalError('checks_unavailable', result.stderr.trim() || `gh pr checks exited ${result.exitCode}`);
+  let entries;
+  try { entries = JSON.parse(result.stdout); }
+  catch { throw new OperationalError('checks_invalid', `gh pr checks did not return JSON: ${result.stderr.trim()}`); }
+  if (!Array.isArray(entries)) throw new OperationalError('checks_invalid', 'Expected JSON check array');
+  return entries;
+}
+
+function classify(entries) {
+  const summary = { total: entries.length, passed: 0, failed: 0,
+    infrastructure: 0, pending: 0, skipped: 0 };
+  const normalized = entries.map((c) => {
+    const bucket = String(c.bucket ?? '').toLowerCase();
+    const state = String(c.state ?? '').toUpperCase();
+    let outcome;
+    if (INFRA_STATES.has(state) || bucket === 'cancel') outcome = 'infrastructure';
+    else if (bucket === 'fail') outcome = 'failed';
+    else if (bucket === 'pass') outcome = 'passed';
+    else if (bucket === 'skipping') outcome = 'skipped';
+    else outcome = 'pending';
+    summary[outcome]++;
+    return {
+      name: c.name, workflow: c.workflow || null, state: c.state, bucket,
+      outcome, url: c.link || null, started_at: c.startedAt || null,
+      completed_at: c.completedAt || null,
+    };
+  });
+  const result = summary.pending ? null : summary.infrastructure ? 'infrastructure_failed'
+    : summary.failed ? 'failed' : summary.total ? 'passed' : null;
+  return { summary, checks: normalized, result };
+}
+
+async function waitForChecks(pr, config) {
+  const deadline = Date.now() + config.timeoutSeconds * 1000;
+  const registrationDeadline = Date.now() + config.noChecksGraceSeconds * 1000;
+  let entries;
+  while (true) {
+    if (Date.now() >= deadline)
+      throw new OperationalError('checks_timeout', `Checks did not complete within ${config.timeoutSeconds}s`);
+    entries = await checks(pr, config.required);
+    const actualNames = new Set(entries.map((c) => c.name));
+    const missing = config.expected.filter((name) => !actualNames.has(name));
+    if (entries.length === 0 && Date.now() >= registrationDeadline)
+      throw new OperationalError('no_checks', 'No GitHub checks appeared within the registration grace period');
+    if (entries.length && !missing.length) {
+      const verdict = classify(entries);
+      if (verdict.result) {
+        say(`All ${entries.length} checks are terminal; settling for ${config.settleSeconds}s`);
+        await sleep(Math.min(config.settleSeconds * 1000, Math.max(0, deadline - Date.now())));
+        entries = await checks(pr, config.required);
+        const settled = classify(entries);
+        if (settled.result && config.expected.every((n) => entries.some((c) => c.name === n)))
+          return settled;
+      }
+      if (!verdict.result) {
+        say(`Waiting for ${verdict.summary.pending} pending check(s) on ${pr.url}`);
+        const remaining = deadline - Date.now();
+        const watched = await command('gh', [
+          'pr', 'checks', String(pr.number), '--repo', pr.repo,
+          ...(config.required ? ['--required'] : []), '--watch', '--interval', '10',
+        ], { timeoutMs: remaining, stream: config.watchOutput });
+        if (watched.timedOut)
+          throw new OperationalError('checks_timeout', `gh pr checks --watch exceeded ${config.timeoutSeconds}s`);
+        // A completed failing check makes --watch exit 1; inspect JSON on the next pass.
+        if (![0, 1, 8].includes(watched.exitCode))
+          throw new OperationalError('watch_failed', watched.stderr.trim() || `gh watch exited ${watched.exitCode}`);
+      }
+    } else {
+      say(entries.length ? `Waiting for expected checks: ${missing.join(', ')}` : 'Waiting for checks to appear');
+      await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
+    }
+  }
+}
+
+async function main() {
+  const options = argsFromCli(process.argv.slice(2));
+  const ref = await issueRef(options);
+  const config = {
+    timeoutSeconds: number('CHECK_TIMEOUT_SECONDS', 1200, 2, 86400),
+    noChecksGraceSeconds: number('NO_CHECKS_GRACE_SECONDS', 90, 0, 3600),
+    settleSeconds: number('SETTLE_SECONDS', 10, 0, 120),
+    required: process.env.REQUIRED_ONLY === '1',
+    expected: (process.env.EXPECTED_CHECKS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+    watchOutput: process.env.WATCH_OUTPUT === '1',
+  };
+  const result = {
+    schema_version: 1,
+    checked_at: null,
+    issue: { ref },
+    pr: null,
+    result: null,
+    reason: null,
+    summary: null,
+    checks: [],
+    error: null,
+  };
+
+  const issue = await tines('issues', 'show', ref);
+  const initialStateId = issue.state?.id;
+  const available = new Set(issue.allowed_transitions?.map((t) => t.name) ?? []);
+  const absent = Object.values(ACTIONS).filter((name) => !available.has(name));
+  if (absent.length)
+    throw new Error(`Issue ${ref} is missing required workflow actions: ${absent.join(', ')}`);
+
+  try {
+    const artifacts = await tines('issues', 'artifacts', 'list', ref);
+    const pr = prFromArtifacts(artifacts.items ?? [], process.env.PR_ARTIFACT_NAME || 'pr');
+    result.pr = { ...pr, head_sha: null, base_ref: null };
+    const allowed = await allowedRepos(options.workspace);
+    if (allowed.length && !allowed.includes(pr.repo))
+      throw new OperationalError('pr_repo_mismatch', `PR repo ${pr.repo} not in effective issue repos: ${allowed.join(', ')}`);
+    const view = await prView(pr);
+    result.pr.head_sha = view.headRefOid;
+    result.pr.base_ref = view.baseRefName;
+    say(`Checking ${pr.url} at ${view.headRefOid.slice(0, 12)}`);
+    const verdict = await waitForChecks(pr, config);
+    result.summary = verdict.summary;
+    result.checks = verdict.checks;
+    // Reject results for a SHA that changed while gh was watching CI.
+    const after = await prView(pr);
+    if (after.headRefOid !== view.headRefOid)
+      throw new OperationalError('head_changed', `PR HEAD changed ${view.headRefOid} -> ${after.headRefOid}`);
+    const latest = prFromArtifacts(
+      (await tines('issues', 'artifacts', 'list', ref)).items ?? [], pr.artifact_name,
+    );
+    if (latest.artifact_version !== pr.artifact_version ||
+        latest.repo !== pr.repo || latest.number !== pr.number)
+      throw new OperationalError('pr_artifact_changed', 'PR artifact changed while checking GitHub');
+    result.result = verdict.result;
+    result.reason = verdict.result === 'infrastructure_failed' ? 'check_infrastructure_failure'
+      : verdict.result === 'failed' ? 'completed_checks_failed' : 'all_checks_passed';
+  } catch (error) {
+    const failure = error instanceof OperationalError ? error
+      : new OperationalError('unexpected_error', error instanceof Error ? error.message : String(error));
+    result.result = 'infrastructure_failed';
+    result.reason = failure.code;
+    result.error = { code: failure.code, message: failure.message.slice(0, 2000) };
+    say(`Infrastructure failure: ${failure.code}: ${failure.message}`);
+  }
+
+  result.checked_at = new Date().toISOString();
+  const workspace = options.workspace || process.cwd();
+  const reportPath = join(workspace, 'github-status-checks.json');
+  await writeFile(reportPath, JSON.stringify(result, null, 2) + '\n');
+  say(`Wrote ${reportPath}`);
+  // Never transition without the report. The existing artifact must be of type 'file'.
+  await jsonCommand('tines', [
+    'issues', 'artifacts', 'attach', ref, 'github-status-checks',
+    '--file', reportPath, '--content-type', 'application/json', '--json',
+  ], { timeoutMs: 60_000 });
+  const currentIssue = await tines('issues', 'show', ref);
+  if (currentIssue.state?.id !== initialStateId)
+    throw new Error(`Issue ${ref} moved from its original state; report attached but not transitioning`);
+  const action = ACTIONS[result.result];
+  if (!currentIssue.allowed_transitions?.some((t) => t.name === action))
+    throw new Error(`Transition '${action}' no longer available; report attached but issue unchanged`);
+  await tines('issues', 'move', ref, action);
+  say(`${ref}: ${action} (${result.reason})`);
+}
+
+main().catch((error) => {
+  console.error(`[github-status-checks] Fatal: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+});
