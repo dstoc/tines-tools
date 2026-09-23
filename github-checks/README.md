@@ -23,7 +23,7 @@ The Tines daemon substitutes and shell-quotes the placeholders, sets `TINES_API_
 ## Behaviour
 
 1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status and HEAD SHA.
-2. Wait for checks to register and complete using `gh pr checks --watch`, then fetch structured results. Optionally restrict to required checks and/or require specific check names.
+2. Wait for GitHub-required checks to register and complete using `gh pr checks --required --watch`, then fetch structured results. Optionally require specific check names when checks register asynchronously.
 3. Re-check the PR's HEAD and artifact version to avoid publishing a result for a superseded PR.
 4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`. For `passed` or `failed`, post a Tines issue comment containing the result, PR number and full HEAD SHA (for example, `Status checks PASSED for PR #163 at 579c27ba1becaa111e3b44dc5193cb59efb4db3e`). Then take exactly one transition. If attaching the report fails or the issue moved to another state, the runner exits non-zero **without commenting or transitioning**. Comment failures are logged but do not block the transition. Infrastructure failures do not generate a status comment.
 
@@ -43,13 +43,10 @@ These are environment variables on the runner machine (or effective Tines enviro
 | --- | --- | --- |
 | `PR_ARTIFACT_NAME` | `pr` | Preferred PR artifact slot. A single PR artifact is accepted when no preferred slot exists. |
 | `CHECK_TIMEOUT_SECONDS` | `1200` | Maximum time waiting for checks (20 minutes). Set below the Tines runner's per-run timeout. |
-| `NO_CHECKS_GRACE_SECONDS` | `90` | Time allowed for checks to appear. |
-| `SETTLE_SECONDS` | `10` | Delay before re-reading an apparently terminal result. |
-| `REQUIRED_ONLY` | `0` | Set to `1` to query only GitHub-required checks. No matching checks triggers an infrastructure failure. |
-| `EXPECTED_CHECKS` | empty | Comma-separated exact check names. The runner waits for all of them rather than declaring success early. |
+| `EXPECTED_CHECKS` | empty | Optional comma-separated exact names of required checks, for workflows whose required checks register at different times. |
 | `WATCH_OUTPUT` | `0` | Set to `1` to include `gh --watch` progress in the Tines run log. |
 
-`EXPECTED_CHECKS` is advisable when check suites start asynchronously; otherwise the settling window can close before late checks register. Set the Tines runner's `max_run_minutes` higher than the check timeout plus setup/report overhead (the Tines default is 30 minutes).
+The runner queries only GitHub-required checks. If none are reported yet, it retries until `CHECK_TIMEOUT_SECONDS`; there is no separate registration grace period or settling delay. `EXPECTED_CHECKS` is advisable for workflows with downstream/late-starting required checks: GitHub CLI can report all *currently visible* checks as complete before another required check registers. Set the Tines runner's `max_run_minutes` higher than the check timeout plus setup/report overhead (the Tines default is 30 minutes).
 
 ## Run locally
 

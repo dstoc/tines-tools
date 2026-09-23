@@ -157,9 +157,9 @@ async function prView(pr) {
   return result;
 }
 
-async function checks(pr, required) {
+async function checks(pr) {
   const args = ['pr', 'checks', String(pr.number), '--repo', pr.repo,
-    '--json', CHECK_FIELDS, ...(required ? ['--required'] : [])];
+    '--json', CHECK_FIELDS, '--required'];
   const result = await command('gh', args);
   if (result.timedOut)
     throw new OperationalError('checks_timeout', 'Timed out fetching GitHub checks');
@@ -202,43 +202,36 @@ function classify(entries) {
 
 async function waitForChecks(pr, config) {
   const deadline = Date.now() + config.timeoutSeconds * 1000;
-  const registrationDeadline = Date.now() + config.noChecksGraceSeconds * 1000;
-  let entries;
+  let sawChecks = false;
   while (true) {
     if (Date.now() >= deadline)
-      throw new OperationalError('checks_timeout', `Checks did not complete within ${config.timeoutSeconds}s`);
-    entries = await checks(pr, config.required);
+      throw sawChecks
+        ? new OperationalError('checks_timeout', `Required checks did not complete within ${config.timeoutSeconds}s`)
+        : new OperationalError('no_checks', `No required checks appeared within ${config.timeoutSeconds}s`);
+    const entries = await checks(pr);
+    sawChecks ||= entries.length > 0;
     const actualNames = new Set(entries.map((c) => c.name));
     const missing = config.expected.filter((name) => !actualNames.has(name));
-    if (entries.length === 0 && Date.now() >= registrationDeadline)
-      throw new OperationalError('no_checks', 'No GitHub checks appeared within the registration grace period');
-    if (entries.length && !missing.length) {
-      const verdict = classify(entries);
-      if (verdict.result) {
-        say(`All ${entries.length} checks are terminal; settling for ${config.settleSeconds}s`);
-        await sleep(Math.min(config.settleSeconds * 1000, Math.max(0, deadline - Date.now())));
-        entries = await checks(pr, config.required);
-        const settled = classify(entries);
-        if (settled.result && config.expected.every((n) => entries.some((c) => c.name === n)))
-          return settled;
-      }
-      if (!verdict.result) {
-        say(`Waiting for ${verdict.summary.pending} pending check(s) on ${pr.url}`);
-        const remaining = deadline - Date.now();
-        const watched = await command('gh', [
-          'pr', 'checks', String(pr.number), '--repo', pr.repo,
-          ...(config.required ? ['--required'] : []), '--watch', '--interval', '10',
-        ], { timeoutMs: remaining, stream: config.watchOutput });
-        if (watched.timedOut)
-          throw new OperationalError('checks_timeout', `gh pr checks --watch exceeded ${config.timeoutSeconds}s`);
-        // A completed failing check makes --watch exit 1; inspect JSON on the next pass.
-        if (![0, 1, 8].includes(watched.exitCode))
-          throw new OperationalError('watch_failed', watched.stderr.trim() || `gh watch exited ${watched.exitCode}`);
-      }
-    } else {
-      say(entries.length ? `Waiting for expected checks: ${missing.join(', ')}` : 'Waiting for checks to appear');
+    if (!entries.length || missing.length) {
+      say(entries.length ? `Waiting for expected required checks: ${missing.join(', ')}` : 'Waiting for required checks to appear');
       await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
+      continue;
     }
+    const verdict = classify(entries);
+    if (verdict.result) return verdict;
+
+    say(`Waiting for ${verdict.summary.pending} pending required check(s) on ${pr.url}`);
+    const watched = await command('gh', [
+      'pr', 'checks', String(pr.number), '--repo', pr.repo,
+      '--required', '--watch', '--interval', '10',
+    ], { timeoutMs: Math.max(1, deadline - Date.now()), stream: config.watchOutput });
+    if (watched.timedOut)
+      throw new OperationalError('checks_timeout', `gh pr checks --watch exceeded ${config.timeoutSeconds}s`);
+    // A completed failing check can make --watch exit 1 while others remain pending.
+    if (![0, 1, 8].includes(watched.exitCode))
+      throw new OperationalError('watch_failed', watched.stderr.trim() || `gh watch exited ${watched.exitCode}`);
+    if (watched.exitCode === 1)
+      await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
   }
 }
 
@@ -247,9 +240,6 @@ async function main() {
   const ref = await issueRef(options);
   const config = {
     timeoutSeconds: number('CHECK_TIMEOUT_SECONDS', 1200, 2, 86400),
-    noChecksGraceSeconds: number('NO_CHECKS_GRACE_SECONDS', 90, 0, 3600),
-    settleSeconds: number('SETTLE_SECONDS', 10, 0, 120),
-    required: process.env.REQUIRED_ONLY === '1',
     expected: (process.env.EXPECTED_CHECKS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     watchOutput: process.env.WATCH_OUTPUT === '1',
   };

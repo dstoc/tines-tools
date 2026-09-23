@@ -46,6 +46,11 @@ if (a[1] === 'view') {
   if (process.env.MOCK_CASE === 'no_checks') { console.log('[]'); process.exit(0); }
   if (process.env.MOCK_CASE === 'no_checks_stderr') { console.error("no checks reported on the 'feature' branch"); process.exit(1); }
   if (process.env.MOCK_CASE === 'gh_error') { console.error('GitHub network failure'); process.exit(4); }
+  if (process.env.MOCK_CASE === 'late_checks') {
+    const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
+    fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
+    if (count === 0) { console.log('[]'); process.exit(0); }
+  }
   let bucket = 'pass'; let state = 'SUCCESS'; let exit = 0;
   if (process.env.MOCK_CASE === 'failed') { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
   if (process.env.MOCK_CASE === 'cancelled') { bucket = 'cancel'; state = 'CANCELLED'; exit = 1; }
@@ -60,7 +65,7 @@ if (a[1] === 'view') {
 } else { console.error('unexpected gh command:', a); process.exit(3); }
 `;
 
-async function simulate(mode) {
+async function simulate(mode, { timeoutSeconds = 2, expected = '' } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tines-check-test-'));
   const bin = join(dir, 'bin');
   const ws = join(dir, 'workspace');
@@ -77,8 +82,8 @@ async function simulate(mode) {
       EVENT_LOG: join(dir, 'events.jsonl'), SHOW_COUNTER: join(dir, 'show_count'),
       GH_COUNTER: join(dir, 'gh_count'), CHECK_COUNTER: join(dir, 'check_count'),
       LIST_COUNTER: join(dir, 'list_count'),
-      MOCK_CASE: mode, CHECK_TIMEOUT_SECONDS: '4', NO_CHECKS_GRACE_SECONDS: '0',
-      SETTLE_SECONDS: '0', TINES_API_URL: 'https://example.test', TINES_API_KEY: 'fake' },
+      MOCK_CASE: mode, CHECK_TIMEOUT_SECONDS: String(timeoutSeconds), EXPECTED_CHECKS: expected,
+      TINES_API_URL: 'https://example.test', TINES_API_KEY: 'fake' },
     encoding: 'utf8', timeout: 10_000,
   });
   let report;
@@ -109,6 +114,8 @@ for (const [mode, status, action, reason] of [
     assert.equal(report.result, status);
     assert.equal(report.reason, reason);
     assert.equal(report.schema_version, 1);
+    const checks = events.filter((e) => e.binary === 'gh' && e.args[1] === 'checks');
+    if (checks.length) assert.ok(checks.every((e) => e.args.includes('--required')), 'only required checks queried and watched');
     const attach = events.findIndex((e) => e.binary === 'tines' && e.args.slice(0, 3).join(' ') === 'issues artifacts attach');
     const move = events.findIndex((e) => e.binary === 'tines' && e.args.slice(0, 2).join(' ') === 'issues move');
     assert.ok(attach >= 0 && move > attach, 'report attached before transition');
@@ -123,8 +130,24 @@ for (const [mode, status, action, reason] of [
       assert.equal(comment, -1, 'do not comment on infrastructure failures');
     }
     if (mode === 'watch_pending') assert.ok(events.some((e) => e.binary === 'gh' && e.args.includes('--watch')));
+    if (mode === 'passed') assert.equal(checks.length, 1, 'no unnecessary settling query');
   });
 }
+
+test('checks that register late are retried until they appear', async () => {
+  const { result, report, events } = await simulate('late_checks', { timeoutSeconds: 8 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'passed');
+  assert.ok(events.filter((e) => e.binary === 'gh' && e.args[1] === 'checks').length >= 2);
+});
+
+test('missing expected required check waits until overall timeout', async () => {
+  const { result, report, events } = await simulate('passed', { expected: 'build,audit' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'infrastructure_failed');
+  assert.equal(report.reason, 'checks_timeout');
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'comment'));
+});
 
 test('comment failure logs warning but still transitions', async () => {
   const { result, report, events } = await simulate('comment_fail');
