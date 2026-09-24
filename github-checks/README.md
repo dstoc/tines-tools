@@ -64,4 +64,6 @@ Run the mock integration tests without GitHub or Tines credentials:
 node --test github-status-checks.test.mjs
 ```
 
+The runner buffers command stdout up to 16 MiB rather than silently truncating large Tines issue JSON. Invalid JSON failures identify the command and response size without logging the response (which may contain sensitive issue content). The runner exits non-zero before attaching a report or transitioning if its initial issue read cannot be parsed.
+
 This is a prototype tested with mocked CLIs. Test it on a non-production workflow/PR before routing real work to it.
