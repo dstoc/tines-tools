@@ -16,7 +16,15 @@ const actions = ['Checks passed', 'Checks failed', 'Infrastructure failed'];
 if (a[0] === 'issues' && a[1] === 'show') {
   const count = Number(fs.existsSync(process.env.SHOW_COUNTER) && fs.readFileSync(process.env.SHOW_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.SHOW_COUNTER, String(count + 1));
-  console.log(JSON.stringify({ state: { id: count && process.env.MOCK_CASE === 'changed_state' ? 'elsewhere' : 'checking' }, allowed_transitions: actions.map((name) => ({ name })) }));
+  if (process.env.MOCK_CASE === 'large_issue') {
+    // Real issue detail responses may include extensive comment histories.
+    console.log(JSON.stringify({ description: 'x'.repeat(100_000), state: { id: 'checking' },
+      allowed_transitions: actions.map((name) => ({ name })) }));
+  } else if (process.env.MOCK_CASE === 'malformed_issue') {
+    console.log('not-json');
+  } else {
+    console.log(JSON.stringify({ state: { id: count && process.env.MOCK_CASE === 'changed_state' ? 'elsewhere' : 'checking' }, allowed_transitions: actions.map((name) => ({ name })) }));
+  }
 } else if (event === 'issues artifacts list') {
   const count = Number(fs.existsSync(process.env.LIST_COUNTER) && fs.readFileSync(process.env.LIST_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.LIST_COUNTER, String(count + 1));
@@ -147,6 +155,22 @@ test('missing expected required check waits until overall timeout', async () => 
   assert.equal(report.result, 'infrastructure_failed');
   assert.equal(report.reason, 'checks_timeout');
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'comment'));
+});
+
+test('large issue JSON is not silently truncated', async () => {
+  const { result, report, events } = await simulate('large_issue');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'passed');
+  assert.ok(events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
+});
+
+test('malformed issue JSON reports the failing command without exposing response body', async () => {
+  const { result, report, events } = await simulate('malformed_issue');
+  assert.equal(result.status, 1);
+  assert.equal(report, null);
+  assert.match(result.stderr, /tines issues show demo\/4 returned invalid JSON \(9 bytes\)/);
+  assert.doesNotMatch(result.stderr, /not-json/);
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
 });
 
 test('comment failure logs warning but still transitions', async () => {
