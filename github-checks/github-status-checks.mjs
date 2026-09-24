@@ -35,16 +35,28 @@ async function command(binary, args, { timeoutMs = 30_000, stream = false } = {}
       env: { ...process.env, GH_PROMPT_DISABLED: '1', CI: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let stdout = '';
+    // Issue detail JSON includes comments and can exceed 64 KiB. Preserve stdout
+    // in complete UTF-8 buffers; only truncate stderr, which is diagnostic text.
+    const maxStdoutBytes = 16 * 1024 * 1024;
+    const stdoutChunks = [];
+    let stdoutBytes = 0;
+    let stdoutTooLarge = false;
     let stderr = '';
     let timedOut = false;
-    const cap = (previous, chunk) => (previous + chunk.toString()).slice(-65_536);
     child.stdout.on('data', (chunk) => {
-      stdout = cap(stdout, chunk);
       if (stream) process.stdout.write(chunk);
+      if (stdoutTooLarge) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxStdoutBytes) {
+        stdoutTooLarge = true;
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
+        return;
+      }
+      stdoutChunks.push(chunk);
     });
     child.stderr.on('data', (chunk) => {
-      stderr = cap(stderr, chunk);
+      stderr = (stderr + chunk.toString()).slice(-65_536);
       if (stream) process.stderr.write(chunk);
     });
     const timer = setTimeout(() => {
@@ -58,7 +70,11 @@ async function command(binary, args, { timeoutMs = 30_000, stream = false } = {}
     });
     child.once('close', (exitCode, signal) => {
       clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode, signal, timedOut });
+      if (stdoutTooLarge)
+        return reject(new OperationalError('output_too_large',
+          `${binary} ${args.slice(0, 3).join(' ')} exceeded ${maxStdoutBytes} stdout bytes`));
+      resolve({ stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+        stderr, exitCode, signal, timedOut });
     });
   });
 }
@@ -72,7 +88,9 @@ async function jsonCommand(binary, args, options) {
   try {
     return JSON.parse(result.stdout);
   } catch {
-    throw new OperationalError('invalid_json', `${binary} returned invalid JSON`);
+    // Avoid echoing the response: issue JSON may contain secrets.
+    throw new OperationalError('invalid_json',
+      `${binary} ${args.slice(0, 3).join(' ')} returned invalid JSON (${Buffer.byteLength(result.stdout)} bytes)`);
   }
 }
 
