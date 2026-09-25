@@ -58,6 +58,12 @@ if (a[1] === 'view') {
   if (a.includes('--watch')) { console.log('watching'); process.exit(0); }
   if (process.env.MOCK_CASE === 'no_checks' || process.env.MOCK_CASE === 'conflict_no_checks') { console.log('[]'); process.exit(0); }
   if (process.env.MOCK_CASE === 'no_checks_stderr') { console.error("no checks reported on the 'feature' branch"); process.exit(1); }
+  if (process.env.MOCK_CASE === 'no_required_checks_stderr') { console.error("no required checks reported on the 'feature' branch"); process.exit(1); }
+  if (process.env.MOCK_CASE === 'required_checks_late') {
+    const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
+    fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
+    if (count === 0) { console.error("no required checks reported on the 'feature' branch"); process.exit(1); }
+  }
   if (process.env.MOCK_CASE === 'gh_error') { console.error('GitHub network failure'); process.exit(4); }
   if (process.env.MOCK_CASE === 'late_checks') {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
@@ -113,6 +119,7 @@ for (const [mode, status, action, reason] of [
   ['cancelled', 'infrastructure_failed', 'Infrastructure failed', 'check_infrastructure_failure'],
   ['no_checks', 'infrastructure_failed', 'Infrastructure failed', 'no_checks'],
   ['no_checks_stderr', 'infrastructure_failed', 'Infrastructure failed', 'no_checks'],
+  ['no_required_checks_stderr', 'infrastructure_failed', 'Infrastructure failed', 'no_checks'],
   ['gh_error', 'infrastructure_failed', 'Infrastructure failed', 'checks_unavailable'],
   ['changed_head', 'infrastructure_failed', 'Infrastructure failed', 'head_changed'],
   ['changed_artifact', 'infrastructure_failed', 'Infrastructure failed', 'pr_artifact_changed'],
@@ -146,6 +153,13 @@ for (const [mode, status, action, reason] of [
     if (mode === 'passed') assert.equal(checks.length, 1, 'no unnecessary settling query');
   });
 }
+
+test('no required checks stderr is retried until checks register', async () => {
+  const { result, report, events } = await simulate('required_checks_late', { timeoutSeconds: 8 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'passed');
+  assert.ok(events.filter((e) => e.binary === 'gh' && e.args[1] === 'checks').length >= 2);
+});
 
 test('checks that register late are retried until they appear', async () => {
   const { result, report, events } = await simulate('late_checks', { timeoutSeconds: 8 });
