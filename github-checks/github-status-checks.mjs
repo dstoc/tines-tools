@@ -165,7 +165,7 @@ function prFromArtifacts(items, preferredName) {
 async function prView(pr) {
   const result = await jsonCommand('gh', [
     'pr', 'view', String(pr.number), '--repo', pr.repo,
-    '--json', 'number,url,state,isDraft,headRefOid,baseRefName',
+    '--json', 'number,url,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus',
   ]);
   if (result.number !== pr.number || result.url?.toLowerCase() !== pr.url.toLowerCase() ||
       !/^[0-9a-f]{40,64}$/i.test(result.headRefOid ?? ''))
@@ -173,6 +173,19 @@ async function prView(pr) {
   if (result.state !== 'OPEN' || result.isDraft)
     throw new OperationalError('pr_not_ready', `PR must be open and not draft (state=${result.state}, draft=${result.isDraft})`);
   return result;
+}
+
+function hasMergeConflicts(view) {
+  return view.mergeable === 'CONFLICTING' || view.mergeStateStatus === 'DIRTY';
+}
+
+function conflictVerdict() {
+  return {
+    result: 'failed',
+    reason: 'merge_conflict',
+    summary: { total: 0, passed: 0, failed: 0, infrastructure: 0, pending: 0, skipped: 0 },
+    checks: [],
+  };
 }
 
 async function checks(pr) {
@@ -231,6 +244,8 @@ async function waitForChecks(pr, config) {
     const actualNames = new Set(entries.map((c) => c.name));
     const missing = config.expected.filter((name) => !actualNames.has(name));
     if (!entries.length || missing.length) {
+      // Checks may never register for a conflicting PR. Do not exhaust the CI deadline.
+      if (hasMergeConflicts(await prView(pr))) return conflictVerdict();
       say(entries.length ? `Waiting for expected required checks: ${missing.join(', ')}` : 'Waiting for required checks to appear');
       await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
       continue;
@@ -291,13 +306,21 @@ async function main() {
     result.pr.head_sha = view.headRefOid;
     result.pr.base_ref = view.baseRefName;
     say(`Checking ${pr.url} at ${view.headRefOid.slice(0, 12)}`);
-    const verdict = await waitForChecks(pr, config);
+    const verdict = hasMergeConflicts(view) ? conflictVerdict() : await waitForChecks(pr, config);
     result.summary = verdict.summary;
     result.checks = verdict.checks;
     // Reject results for a SHA that changed while gh was watching CI.
     const after = await prView(pr);
     if (after.headRefOid !== view.headRefOid)
       throw new OperationalError('head_changed', `PR HEAD changed ${view.headRefOid} -> ${after.headRefOid}`);
+    // A PR can become conflicting while checks are running; don't report stale success.
+    if (hasMergeConflicts(after) && verdict.reason !== 'merge_conflict') {
+      const conflict = conflictVerdict();
+      result.summary = conflict.summary;
+      result.checks = conflict.checks;
+      verdict.result = conflict.result;
+      verdict.reason = conflict.reason;
+    }
     const latest = prFromArtifacts(
       (await tines('issues', 'artifacts', 'list', ref)).items ?? [], pr.artifact_name,
     );
@@ -305,8 +328,8 @@ async function main() {
         latest.repo !== pr.repo || latest.number !== pr.number)
       throw new OperationalError('pr_artifact_changed', 'PR artifact changed while checking GitHub');
     result.result = verdict.result;
-    result.reason = verdict.result === 'infrastructure_failed' ? 'check_infrastructure_failure'
-      : verdict.result === 'failed' ? 'completed_checks_failed' : 'all_checks_passed';
+    result.reason = verdict.reason ?? (verdict.result === 'infrastructure_failed' ? 'check_infrastructure_failure'
+      : verdict.result === 'failed' ? 'completed_checks_failed' : 'all_checks_passed');
   } catch (error) {
     const failure = error instanceof OperationalError ? error
       : new OperationalError('unexpected_error', error instanceof Error ? error.message : String(error));
@@ -333,8 +356,10 @@ async function main() {
   if (!currentIssue.allowed_transitions?.some((t) => t.name === action))
     throw new Error(`Transition '${action}' no longer available; report attached but issue unchanged`);
   if (result.result === 'passed' || result.result === 'failed') {
-    const status = result.result.toUpperCase();
-    const message = `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}`;
+    const status = result.reason === 'merge_conflict' ? 'BLOCKED' : result.result.toUpperCase();
+    const detail = result.reason === 'merge_conflict'
+      ? `: merge conflicts with ${result.pr.base_ref}` : '';
+    const message = `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}${detail}`;
     try {
       // --json precedes positional arguments: the comment CLI passes through trailing options.
       await jsonCommand('tines', ['issues', 'comment', '--json', ref, message]);
