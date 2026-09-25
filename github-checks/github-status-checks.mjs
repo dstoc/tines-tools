@@ -253,13 +253,17 @@ async function waitForChecks(pr, config) {
     const verdict = classify(entries);
     if (verdict.result) return verdict;
 
+    // A pending check can become blocked by a merge conflict. Recheck GitHub
+    // before watching and cap each watch so conflicts are noticed promptly.
+    if (hasMergeConflicts(await prView(pr))) return conflictVerdict();
     say(`Waiting for ${verdict.summary.pending} pending required check(s) on ${pr.url}`);
     const watched = await command('gh', [
       'pr', 'checks', String(pr.number), '--repo', pr.repo,
       '--required', '--watch', '--interval', '10',
-    ], { timeoutMs: Math.max(1, deadline - Date.now()), stream: config.watchOutput });
-    if (watched.timedOut)
-      throw new OperationalError('checks_timeout', `gh pr checks --watch exceeded ${config.timeoutSeconds}s`);
+    ], { timeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())),
+      stream: config.watchOutput });
+    // Restart a bounded watch to recheck mergeability during long-running CI.
+    if (watched.timedOut) continue;
     // A completed failing check can make --watch exit 1 while others remain pending.
     if (![0, 1, 8].includes(watched.exitCode))
       throw new OperationalError('watch_failed', watched.stderr.trim() || `gh watch exited ${watched.exitCode}`);
