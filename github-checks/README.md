@@ -22,15 +22,15 @@ The Tines daemon substitutes and shell-quotes the placeholders, sets `TINES_API_
 
 ## Behaviour
 
-1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status and HEAD SHA.
-2. Wait for GitHub-required checks to register and complete using `gh pr checks --required --watch`, then fetch structured results. Optionally require specific check names when checks register asynchronously.
-3. Re-check the PR's HEAD and artifact version to avoid publishing a result for a superseded PR.
-4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`. For `passed` or `failed`, post a Tines issue comment containing the result, PR number and full HEAD SHA (for example, `Status checks PASSED for PR #163 at 579c27ba1becaa111e3b44dc5193cb59efb4db3e`). Then take exactly one transition. If attaching the report fails or the issue moved to another state, the runner exits non-zero **without commenting or transitioning**. Comment failures are logged but do not block the transition. Infrastructure failures do not generate a status comment.
+1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status and HEAD SHA. Check mergeability before waiting for checks.
+2. If the PR has merge conflicts (`mergeable: CONFLICTING` or `mergeStateStatus: DIRTY`), immediately classify it as `failed` with reason `merge_conflict`. Otherwise wait for required checks using `gh pr checks --required --watch`, periodically rechecking mergeability. Optionally require specific check names when checks register asynchronously.
+3. Re-check the PR's HEAD, mergeability, and artifact version to avoid publishing a passing result for a superseded or newly conflicting PR.
+4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`. For `passed` or `failed`, post a Tines issue comment containing the result, PR number and full HEAD SHA (for example, `Status checks PASSED for PR #163 at 579c27ba1becaa111e3b44dc5193cb59efb4db3e`). Then take exactly one transition. If attaching the report fails or the issue moved to another state, the runner exits non-zero **without commenting or transitioning**. Comment failures are logged but do not block the transition. Infrastructure failures do not generate a status comment. Merge conflicts generate `Status checks BLOCKED for PR #163 at <full-sha>: merge conflicts with main` and take `Checks failed` without waiting for checks that GitHub may never start.
 
 | Result | Transition | Meaning |
 | --- | --- | --- |
 | `passed` | Checks passed | All observed, selected checks completed successfully (skipped checks are neutral). |
-| `failed` | Checks failed | At least one check completed with a failure conclusion. |
+| `failed` | Checks failed | At least one check completed with a failure conclusion, or the PR has merge conflicts (reported as `merge_conflict`). |
 | `infrastructure_failed` | Infrastructure failed | Missing/invalid PR, cancelled or timed-out checks, GitHub/CLI errors, no checks, runner deadline, or superseded PR. |
 
 The report records the issue reference, PR and HEAD SHA, timestamp, per-check states/URLs and counts, overall result, and a machine-readable `reason` and `error` when applicable. This is a process report, not an attestation; GitHub status can change after the final read.
@@ -46,7 +46,7 @@ These are environment variables on the runner machine (or effective Tines enviro
 | `EXPECTED_CHECKS` | empty | Optional comma-separated exact names of required checks, for workflows whose required checks register at different times. |
 | `WATCH_OUTPUT` | `0` | Set to `1` to include `gh --watch` progress in the Tines run log. |
 
-The runner queries only GitHub-required checks. If none are reported yet, it retries until `CHECK_TIMEOUT_SECONDS`; there is no separate registration grace period or settling delay. `EXPECTED_CHECKS` is advisable for workflows with downstream/late-starting required checks: GitHub CLI can report all *currently visible* checks as complete before another required check registers. Set the Tines runner's `max_run_minutes` higher than the check timeout plus setup/report overhead (the Tines default is 30 minutes).
+The runner queries only GitHub-required checks. If none are reported yet, it retries until `CHECK_TIMEOUT_SECONDS`, checking for merge conflicts on each retry; there is no separate registration grace period or settling delay. Active check watches are bounded to 30 seconds so the runner can detect a new conflict while waiting. `EXPECTED_CHECKS` is advisable for workflows with downstream/late-starting required checks: GitHub CLI can report all *currently visible* checks as complete before another required check registers. Set the Tines runner's `max_run_minutes` higher than the check timeout plus setup/report overhead (the Tines default is 30 minutes).
 
 ## Run locally
 

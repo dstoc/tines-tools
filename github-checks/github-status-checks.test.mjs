@@ -48,10 +48,15 @@ if (a[1] === 'view') {
   const count = Number(fs.existsSync(process.env.GH_COUNTER) && fs.readFileSync(process.env.GH_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.GH_COUNTER, String(count + 1));
   console.log(JSON.stringify({ number: 123, url: 'https://github.com/acme/app/pull/123', state: 'OPEN', isDraft: process.env.MOCK_CASE === 'draft_pr',
-    headRefOid: process.env.MOCK_CASE === 'changed_head' && count > 0 ? 'b'.repeat(40) : 'a'.repeat(40), baseRefName: 'main' }));
+    headRefOid: process.env.MOCK_CASE === 'changed_head' && count > 0 ? 'b'.repeat(40) : 'a'.repeat(40), baseRefName: 'main',
+    mergeable: ['conflict_initial', 'conflict_dirty'].includes(process.env.MOCK_CASE) ||
+      ['conflict_no_checks', 'conflict_pending', 'conflict_after_checks'].includes(process.env.MOCK_CASE) && count > 0
+      ? 'CONFLICTING' : process.env.MOCK_CASE === 'merge_unknown' ? 'UNKNOWN' : 'MERGEABLE',
+    mergeStateStatus: process.env.MOCK_CASE === 'conflict_dirty' ? 'DIRTY' :
+      process.env.MOCK_CASE === 'merge_blocked' ? 'BLOCKED' : 'CLEAN' }));
 } else if (a[1] === 'checks') {
   if (a.includes('--watch')) { console.log('watching'); process.exit(0); }
-  if (process.env.MOCK_CASE === 'no_checks') { console.log('[]'); process.exit(0); }
+  if (process.env.MOCK_CASE === 'no_checks' || process.env.MOCK_CASE === 'conflict_no_checks') { console.log('[]'); process.exit(0); }
   if (process.env.MOCK_CASE === 'no_checks_stderr') { console.error("no checks reported on the 'feature' branch"); process.exit(1); }
   if (process.env.MOCK_CASE === 'gh_error') { console.error('GitHub network failure'); process.exit(4); }
   if (process.env.MOCK_CASE === 'late_checks') {
@@ -62,7 +67,7 @@ if (a[1] === 'view') {
   let bucket = 'pass'; let state = 'SUCCESS'; let exit = 0;
   if (process.env.MOCK_CASE === 'failed') { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
   if (process.env.MOCK_CASE === 'cancelled') { bucket = 'cancel'; state = 'CANCELLED'; exit = 1; }
-  if (process.env.MOCK_CASE === 'watch_pending') {
+  if (process.env.MOCK_CASE === 'watch_pending' || process.env.MOCK_CASE === 'conflict_pending') {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
     fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
     if (count === 0) { bucket = 'pending'; state = 'IN_PROGRESS'; exit = 8; }
@@ -171,6 +176,53 @@ test('malformed issue JSON reports the failing command without exposing response
   assert.match(result.stderr, /tines issues show demo\/4 returned invalid JSON \(9 bytes\)/);
   assert.doesNotMatch(result.stderr, /not-json/);
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
+});
+
+test('merge conflicts route directly to implementation without waiting for CI', async () => {
+  for (const mode of ['conflict_initial', 'conflict_dirty']) {
+    const { result, report, events } = await simulate(mode);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(report.result, 'failed');
+    assert.equal(report.reason, 'merge_conflict');
+    assert.deepEqual(report.checks, []);
+    assert.ok(!events.some((e) => e.binary === 'gh' && e.args[1] === 'checks'),
+      'do not query checks for known conflicts');
+    const comment = events.find((e) => e.binary === 'tines' && e.args[1] === 'comment');
+    assert.equal(comment.args[3],
+      `Status checks BLOCKED for PR #123 at ${sha}: merge conflicts with main`);
+    const move = events.find((e) => e.binary === 'tines' && e.args[1] === 'move');
+    assert.equal(move.args[3], 'Checks failed');
+  }
+});
+
+test('merge conflicts arising while waiting for checks are detected', async () => {
+  for (const mode of ['conflict_no_checks', 'conflict_pending']) {
+    const { result, report, events } = await simulate(mode);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(report.result, 'failed');
+    assert.equal(report.reason, 'merge_conflict');
+    assert.ok(events.some((e) => e.binary === 'gh' && e.args[1] === 'checks'));
+    assert.equal(events.find((e) => e.binary === 'tines' && e.args[1] === 'move').args[3],
+      'Checks failed');
+  }
+});
+
+test('merge conflicts arising after checks complete take precedence over success', async () => {
+  const { result, report, events } = await simulate('conflict_after_checks');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'failed');
+  assert.equal(report.reason, 'merge_conflict');
+  assert.ok(events.some((e) => e.binary === 'gh' && e.args[1] === 'checks'));
+  const comment = events.find((e) => e.binary === 'tines' && e.args[1] === 'comment');
+  assert.match(comment.args[3], /Status checks BLOCKED/);
+});
+
+test('unknown mergeability and other BLOCKED merge states are not assumed to be conflicts', async () => {
+  for (const mode of ['merge_unknown', 'merge_blocked']) {
+    const { result, report } = await simulate(mode);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(report.result, 'passed');
+  }
 });
 
 test('comment failure logs warning but still transitions', async () => {
