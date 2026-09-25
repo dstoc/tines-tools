@@ -195,9 +195,10 @@ async function checks(pr) {
   if (result.timedOut)
     throw new OperationalError('checks_timeout', 'Timed out fetching GitHub checks');
   // gh exits nonzero when checks fail (1) or are pending (8), even with JSON output.
-  // With no checks, some versions of gh emit only a diagnostic on stderr.
+  // With no (required) checks, gh can exit 1 with only a diagnostic on stderr.
+  // Treat either wording as an empty result so the caller can retry/check conflicts.
   if (result.exitCode === 1 && !result.stdout.trim() &&
-      /no checks reported/i.test(result.stderr)) return [];
+      /no (?:required )?checks reported/i.test(result.stderr)) return [];
   if (![0, 1, 8].includes(result.exitCode))
     throw new OperationalError('checks_unavailable', result.stderr.trim() || `gh pr checks exited ${result.exitCode}`);
   let entries;
