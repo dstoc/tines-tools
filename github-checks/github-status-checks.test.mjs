@@ -43,6 +43,11 @@ const mockGh = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.EVENT_LOG, JSON.stringify({ binary: 'gh', args: a }) + '\\n');
+if (a[0] === 'run' && a[1] === 'view') {
+  if (process.env.MOCK_CASE === 'log_fetch_fail') { console.error('log fetch failed'); process.exit(1); }
+  console.log('build\tRun tests\tAssertionError: expected 1 to equal 2');
+  process.exit(0);
+}
 if (a[0] !== 'pr') process.exit(3);
 if (a[1] === 'view') {
   const count = Number(fs.existsSync(process.env.GH_COUNTER) && fs.readFileSync(process.env.GH_COUNTER, 'utf8')) || 0;
@@ -71,15 +76,20 @@ if (a[1] === 'view') {
     if (count === 0) { console.log('[]'); process.exit(0); }
   }
   let bucket = 'pass'; let state = 'SUCCESS'; let exit = 0;
-  if (process.env.MOCK_CASE === 'failed') { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
+  if (['failed', 'log_fetch_fail', 'external_failed'].includes(process.env.MOCK_CASE)) { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
   if (process.env.MOCK_CASE === 'cancelled') { bucket = 'cancel'; state = 'CANCELLED'; exit = 1; }
   if (process.env.MOCK_CASE === 'watch_pending' || process.env.MOCK_CASE === 'conflict_pending') {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
     fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
     if (count === 0) { bucket = 'pending'; state = 'IN_PROGRESS'; exit = 8; }
   }
+  const link = process.env.MOCK_CASE === 'external_failed'
+    ? 'https://ci.example.test/build/8'
+    : process.env.MOCK_CASE === 'failed_job'
+      ? 'https://github.com/acme/app/actions/runs/8/job/9'
+      : 'https://github.com/acme/app/actions/runs/8';
   console.log(JSON.stringify([{ name: 'build', workflow: 'CI', state, bucket,
-    link: 'https://github.com/acme/app/actions/runs/8', startedAt: '2026-09-23T00:00:00Z', completedAt: '2026-09-23T00:01:00Z' }]));
+    link, startedAt: '2026-09-23T00:00:00Z', completedAt: '2026-09-23T00:01:00Z' }]));
   process.exit(exit);
 } else { console.error('unexpected gh command:', a); process.exit(3); }
 `;
@@ -108,9 +118,12 @@ async function simulate(mode, { timeoutSeconds = 2, expected = '' } = {}) {
   let report;
   try { report = JSON.parse(await readFile(join(ws, 'github-status-checks.json'), 'utf8')); }
   catch { report = null; }
+  let failureLogs;
+  try { failureLogs = await readFile(join(ws, 'github-status-check-logs.txt'), 'utf8'); }
+  catch { failureLogs = null; }
   const events = (await readFile(join(dir, 'events.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   await rm(dir, { recursive: true, force: true });
-  return { result, report, events };
+  return { result, report, events, failureLogs };
 }
 
 for (const [mode, status, action, reason] of [
@@ -154,6 +167,47 @@ for (const [mode, status, action, reason] of [
   });
 }
 
+test('failed GitHub Actions checks attach failed-step logs before transition', async () => {
+  const { result, report, events, failureLogs } = await simulate('failed');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'failed');
+  assert.match(failureLogs, /GitHub Actions failure logs/);
+  assert.match(failureLogs, /AssertionError: expected 1 to equal 2/);
+  const runView = events.find((e) => e.binary === 'gh' && e.args[0] === 'run' && e.args[1] === 'view');
+  assert.deepEqual(runView.args.slice(0, 4), ['run', 'view', '8', '--repo']);
+  assert.ok(runView.args.includes('--log-failed'));
+  const attachments = events.filter((e) => e.binary === 'tines' && e.args.slice(0, 3).join(' ') === 'issues artifacts attach');
+  assert.equal(attachments.length, 2);
+  assert.equal(attachments[1].args[3], 'github-status-check-logs');
+  const move = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'move');
+  const logsAttach = events.findIndex((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs');
+  assert.ok(logsAttach !== -1 && move > logsAttach);
+});
+
+test('job URLs fetch only the failed GitHub Actions job', async () => {
+  const { result, events } = await simulate('failed_job');
+  assert.equal(result.status, 0, result.stderr);
+  const runView = events.find((e) => e.binary === 'gh' && e.args[0] === 'run');
+  assert.ok(runView.args.includes('--job'));
+  assert.equal(runView.args[runView.args.indexOf('--job') + 1], '9');
+});
+
+test('external CI failures do not create an Actions-log artifact', async () => {
+  const { result, events, failureLogs } = await simulate('external_failed');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(failureLogs, null);
+  assert.ok(!events.some((e) => e.binary === 'gh' && e.args[0] === 'run'));
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs'));
+});
+
+test('failure-log fetch errors are diagnostic only', async () => {
+  const { result, report, events, failureLogs } = await simulate('log_fetch_fail');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(report.result, 'failed');
+  assert.match(failureLogs, /unable to fetch logs: log fetch failed/);
+  assert.ok(events.some((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs'));
+  assert.equal(events.find((e) => e.binary === 'tines' && e.args[1] === 'move').args[3], 'Checks failed');
+});
 test('no required checks stderr is retried until checks register', async () => {
   const { result, report, events } = await simulate('required_checks_late', { timeoutSeconds: 8 });
   assert.equal(result.status, 0, result.stderr);
