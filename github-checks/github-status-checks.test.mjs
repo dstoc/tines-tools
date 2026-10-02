@@ -76,7 +76,7 @@ if (a[1] === 'view') {
     if (count === 0) { console.log('[]'); process.exit(0); }
   }
   let bucket = 'pass'; let state = 'SUCCESS'; let exit = 0;
-  if (['failed', 'log_fetch_fail', 'external_failed'].includes(process.env.MOCK_CASE)) { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
+  if (['failed', 'failed_job', 'log_fetch_fail', 'external_failed'].includes(process.env.MOCK_CASE)) { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
   if (process.env.MOCK_CASE === 'cancelled') { bucket = 'cancel'; state = 'CANCELLED'; exit = 1; }
   if (process.env.MOCK_CASE === 'watch_pending' || process.env.MOCK_CASE === 'conflict_pending') {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
@@ -178,9 +178,9 @@ test('failed GitHub Actions checks attach failed-step logs before transition', a
   assert.ok(runView.args.includes('--log-failed'));
   const attachments = events.filter((e) => e.binary === 'tines' && e.args.slice(0, 3).join(' ') === 'issues artifacts attach');
   assert.equal(attachments.length, 2);
-  assert.equal(attachments[1].args[3], 'github-status-check-logs');
+  assert.equal(attachments[1].args[4], 'github-status-check-logs');
   const move = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'move');
-  const logsAttach = events.findIndex((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs');
+  const logsAttach = events.findIndex((e) => e.binary === 'tines' && e.args[4] === 'github-status-check-logs');
   assert.ok(logsAttach !== -1 && move > logsAttach);
 });
 
@@ -197,7 +197,7 @@ test('external CI failures do not create an Actions-log artifact', async () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(failureLogs, null);
   assert.ok(!events.some((e) => e.binary === 'gh' && e.args[0] === 'run'));
-  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs'));
+  assert.ok(!events.some((e) => e.binary === 'tines' && e.args[4] === 'github-status-check-logs'));
 });
 
 test('failure-log fetch errors are diagnostic only', async () => {
@@ -205,7 +205,7 @@ test('failure-log fetch errors are diagnostic only', async () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(report.result, 'failed');
   assert.match(failureLogs, /unable to fetch logs: log fetch failed/);
-  assert.ok(events.some((e) => e.binary === 'tines' && e.args[3] === 'github-status-check-logs'));
+  assert.ok(events.some((e) => e.binary === 'tines' && e.args[4] === 'github-status-check-logs'));
   assert.equal(events.find((e) => e.binary === 'tines' && e.args[1] === 'move').args[3], 'Checks failed');
 });
 test('no required checks stderr is retried until checks register', async () => {
