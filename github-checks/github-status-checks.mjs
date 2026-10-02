@@ -10,6 +10,8 @@ const ACTIONS = {
   infrastructure_failed: 'Infrastructure failed',
 };
 const CHECK_FIELDS = 'name,workflow,state,bucket,link,startedAt,completedAt';
+const FAILURE_LOG_ARTIFACT = 'github-status-check-logs';
+const FAILURE_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const INFRA_STATES = new Set([
   'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE', 'STALE', 'ACTION_REQUIRED', 'ERROR',
 ]);
@@ -208,6 +210,142 @@ async function checks(pr) {
   return entries;
 }
 
+function actionLogTarget(url, repo) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== 'github.com') return null;
+    const [owner, name] = repo.split('/');
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts.length < 5 || parts[0].toLowerCase() !== owner ||
+        parts[1].toLowerCase() !== name || parts[2] !== 'actions' || parts[3] !== 'runs')
+      return null;
+    const runId = parts[4];
+    if (!/^\d+$/.test(runId)) return null;
+    const jobId = parts[5] === 'job' && /^\d+$/.test(parts[6] ?? '') ? parts[6] : null;
+    return { runId, jobId };
+  } catch {
+    return null;
+  }
+}
+
+function appendBounded(parts, text, state) {
+  if (state.remaining <= 0) {
+    if (text) state.truncated = true;
+    return;
+  }
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= state.remaining) {
+    parts.push(text);
+    state.remaining -= bytes.length;
+    return;
+  }
+  const chunk = bytes.subarray(0, state.remaining).toString('utf8').replace(/\uFFFD$/, '');
+  parts.push(chunk);
+  state.remaining -= Buffer.byteLength(chunk);
+  state.truncated = true;
+}
+
+async function collectFailureLogs(pr, result) {
+  if (result.result !== 'failed' || result.reason === 'merge_conflict') return null;
+  const failed = result.checks.filter((check) => check.outcome === 'failed');
+  const targets = [];
+  const seen = new Set();
+  const skipped = [];
+  for (const check of failed) {
+    const target = actionLogTarget(check.url, pr.repo);
+    if (!target) {
+      skipped.push(check);
+      continue;
+    }
+    const key = target.jobId ? `job:${target.jobId}` : `run:${target.runId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({ ...target, check });
+  }
+  if (!targets.length) return null;
+
+  const truncationNotice = '\n[truncated: combined failure logs exceeded 5 MiB]\n';
+  const state = {
+    remaining: FAILURE_LOG_MAX_BYTES - Buffer.byteLength(truncationNotice),
+    truncated: false,
+  };
+  const parts = [];
+  appendBounded(parts,
+    `GitHub Actions failure logs\nPR: ${pr.url}\nSHA: ${result.pr.head_sha}\n\n`, state);
+
+  for (const target of targets) {
+    if (state.remaining <= 0) {
+      state.truncated = true;
+      break;
+    }
+    appendBounded(parts, [
+      '='.repeat(80),
+      `Check: ${target.check.name}`,
+      `Workflow: ${target.check.workflow ?? '(unknown)'}`,
+      `URL: ${target.check.url}`,
+      '='.repeat(80),
+      '',
+    ].join('\n'), state);
+    if (state.remaining <= 0) break;
+
+    const args = target.jobId
+      ? ['run', 'view', '--repo', pr.repo, '--job', target.jobId, '--log-failed']
+      : ['run', 'view', target.runId, '--repo', pr.repo, '--log-failed'];
+    try {
+      const log = await command('gh', args, { timeoutMs: 60_000 });
+      if (log.timedOut) {
+        appendBounded(parts, '[unable to fetch logs: command timed out]\n\n', state);
+      } else if (log.exitCode !== 0) {
+        const diagnostic = (log.stderr.trim() || `gh run view exited ${log.exitCode}`).slice(0, 2000);
+        appendBounded(parts, `[unable to fetch logs: ${diagnostic}]\n\n`, state);
+      } else {
+        appendBounded(parts, log.stdout || '[no failed-step log output]\n', state);
+        appendBounded(parts, '\n', state);
+      }
+    } catch (error) {
+      appendBounded(parts,
+        `[unable to fetch logs: ${error instanceof Error ? error.message : String(error)}]\n\n`,
+        state);
+    }
+  }
+
+  if (skipped.length && state.remaining > 0) {
+    appendBounded(parts, '\nExternal/non-Actions failed checks not fetched:\n', state);
+    for (const check of skipped)
+      appendBounded(parts, `- ${check.name}: ${check.url ?? '(no URL)'}\n`, state);
+  }
+  if (state.truncated) parts.push(truncationNotice);
+  return parts.join('');
+}
+
+async function attachFailureLogs(ref, result, workspace) {
+  let contents;
+  try {
+    contents = await collectFailureLogs(result.pr, result);
+  } catch (error) {
+    say(`Warning: could not collect GitHub Actions failure logs: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (!contents) {
+    if (result.result === 'failed' && result.reason !== 'merge_conflict')
+      say('No GitHub Actions failure logs available to attach');
+    return;
+  }
+
+  const path = join(workspace, 'github-status-check-logs.txt');
+  try {
+    await writeFile(path, contents);
+    await jsonCommand('tines', [
+      'issues', 'artifacts', 'attach', ref, FAILURE_LOG_ARTIFACT,
+      '--file', path, '--content-type', 'text/plain', '--json',
+    ], { timeoutMs: 60_000 });
+    say(`Attached ${FAILURE_LOG_ARTIFACT}`);
+  } catch (error) {
+    // Diagnostics are best-effort; a logging failure must not block the workflow result.
+    say(`Warning: could not attach GitHub Actions failure logs: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 function classify(entries) {
   const summary = { total: entries.length, passed: 0, failed: 0,
     infrastructure: 0, pending: 0, skipped: 0 };
@@ -354,6 +492,7 @@ async function main() {
     'issues', 'artifacts', 'attach', ref, 'github-status-checks',
     '--file', reportPath, '--content-type', 'application/json', '--json',
   ], { timeoutMs: 60_000 });
+  await attachFailureLogs(ref, result, workspace);
   const currentIssue = await tines('issues', 'show', ref);
   if (currentIssue.state?.id !== initialStateId)
     throw new Error(`Issue ${ref} moved from its original state; report attached but not transitioning`);
