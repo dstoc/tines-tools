@@ -12,6 +12,7 @@ const a=process.argv.slice(2).filter(x=>x!=='--json');
 fs.appendFileSync(process.env.LOG,JSON.stringify({bin:'tines',args:a})+'\\n');
 if(a[0]==='issues'&&a[1]==='show') console.log(JSON.stringify({state:{id:'waiting'},allowed_transitions:[{name:'Merged'},{name:'Merge failed'}]}));
 else if(a[0]==='issues'&&a[1]==='artifacts'&&a[2]==='list') console.log(JSON.stringify({items:[{name:'pr',artifact_type:'pr',current_version:{version:1,pr_repo_url:'https://github.com/acme/app',pr_number:123}}]}));
+else if(a[0]==='issues'&&a[1]==='comment'&&process.env.COMMENT_FAIL==='1') {console.error('comment failed');process.exit(1);}
 else console.log('{}');
 `;
 const mockGh=`#!/usr/bin/env node
@@ -30,21 +31,33 @@ if(bucket==='fail') process.exit(1);
 if(bucket==='pending') process.exit(8);
 }else process.exit(3);
 `;
-async function simulate(mode){
+async function simulate(mode,{commentFail=false}={}){
 const dir=await mkdtemp(join(tmpdir(),'merge-test-'));
 try{
 const bin=join(dir,'bin');await mkdir(bin);
 for(const [name,src] of [['tines',mockTines],['gh',mockGh]]){const p=join(bin,name);await writeFile(p,src);await chmod(p,0o755);}
 const log=join(dir,'log');await writeFile(log,'');
-const r=spawnSync(process.execPath,[script,'--issue','demo/4','--workspace',dir],{encoding:'utf8',timeout:10000,env:{...process.env,PATH:bin+':'+process.env.PATH,LOG:log,COUNT:join(dir,'count'),MODE:mode,MERGE_TIMEOUT_SECONDS:'0.8',POLL_INTERVAL_SECONDS:'0.05',MISSING_CHECK_GRACE_SECONDS:'0'}});
+const r=spawnSync(process.execPath,[script,'--issue','demo/4','--workspace',dir],{encoding:'utf8',timeout:10000,env:{...process.env,PATH:bin+':'+process.env.PATH,LOG:log,COUNT:join(dir,'count'),MODE:mode,COMMENT_FAIL:commentFail?'1':'0',MERGE_TIMEOUT_SECONDS:'0.8',POLL_INTERVAL_SECONDS:'0.05',MISSING_CHECK_GRACE_SECONDS:'0'}});
 const events=(await readFile(log,'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
 let report=null;try{report=JSON.parse(await readFile(join(dir,'github-merge-status.json'),'utf8'));}catch{}
 return {r,events,report};
 }finally{await rm(dir,{recursive:true,force:true});}
 }
-for(const [mode,action,reason] of [['merged','Merged','merged'],['eventually_merged','Merged','merged'],['conflict','Merge failed','merge_conflict'],['closed','Merge failed','closed_without_merge'],['draft','Merge failed','draft_pr'],['no_auto','Merge failed','auto_merge_disabled'],['no_approval','Merge failed','approval_missing'],['failed_checks','Merge failed','required_checks_failed'],['missing_checks','Merge failed','required_checks_missing'],['blocked','Merge failed','merge_blocked']]){
-test(mode,async()=>{const {r,events,report}=await simulate(mode);assert.equal(r.status,0,r.stderr);assert.equal(report.reason,reason);const move=events.find(x=>x.bin==='tines'&&x.args[1]==='move');assert.equal(move.args[3],action);assert.ok(events.findIndex(x=>x.bin==='tines'&&x.args[2]==='attach')<events.indexOf(move));});
+for(const [mode,action,reason,comment] of [
+ ['merged','Merged','merged','PR #123 merged from'],
+ ['eventually_merged','Merged','merged','PR #123 merged from'],
+ ['conflict','Merge failed','merge_conflict','merge conflicts with main'],
+ ['closed','Merge failed','closed_without_merge','closed without merging'],
+ ['draft','Merge failed','draft_pr','still a draft'],
+ ['no_auto','Merge failed','auto_merge_disabled','auto-merge is disabled'],
+ ['no_approval','Merge failed','approval_missing','required approval is missing'],
+ ['failed_checks','Merge failed','required_checks_failed','required checks failed: build'],
+ ['missing_checks','Merge failed','required_checks_missing','no required checks were reported'],
+ ['blocked','Merge failed','merge_blocked','GitHub reports merge state BLOCKED'],
+]){
+test(mode,async()=>{const {r,events,report}=await simulate(mode);assert.equal(r.status,0,r.stderr);assert.equal(report.reason,reason);const moveIndex=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='move');const commentIndex=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='comment');assert.ok(moveIndex>=0);assert.ok(commentIndex>=0);assert.ok(commentIndex<moveIndex);assert.match(events[commentIndex].args[3],new RegExp(comment.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));assert.equal(events[moveIndex].args[3],action);assert.ok(events.findIndex(x=>x.bin==='tines'&&x.args[2]==='attach')<commentIndex);});
 }
+test('comment failure does not block transition',async()=>{const {r,events}=await simulate('merged',{commentFail:true});assert.equal(r.status,0,r.stderr);assert.ok(events.some(x=>x.bin==='tines'&&x.args[1]==='comment'));assert.ok(events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merged'));});
 for(const mode of ['pending','behind']){
-test(mode+' times out without transition',async()=>{const {r,events}=await simulate(mode);assert.notEqual(r.status,0);assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'));});
+test(mode+' times out without transition',async()=>{const {r,events}=await simulate(mode);assert.notEqual(r.status,0);assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'));assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='comment'));});
 }
