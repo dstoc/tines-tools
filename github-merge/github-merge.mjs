@@ -79,5 +79,26 @@ try {
  const current=await tines('issues','show',ref);
  const action=result.result==='merged'?'Merged':'Merge failed';
  if(current.state?.id!==issue.state?.id||!current.allowed_transitions?.some(x=>x.name===action)) throw new Error('Issue state changed');
+ const failedChecks=result.checks.filter(x=>['fail','cancel'].includes(x.bucket)).map(x=>x.name).filter(Boolean);
+ const missingChecks=expected.filter(name=>!result.checks.some(check=>check.name===name));
+ const detail=result.reason==='merged'
+  ? `PR #${pr.number} merged from ${result.view.headRefOid}`
+  : result.reason==='merge_conflict' ? `merge conflicts with ${result.view.baseRefName}`
+  : result.reason==='closed_without_merge' ? 'PR was closed without merging'
+  : result.reason==='draft_pr' ? 'PR is still a draft'
+  : result.reason==='auto_merge_disabled' ? 'auto-merge is disabled'
+  : result.reason==='approval_missing' ? `required approval is missing (${result.view.reviewDecision||'unknown review state'})`
+  : result.reason==='required_checks_failed' ? `required checks failed${failedChecks.length?`: ${failedChecks.join(', ')}`:''}`
+  : result.reason==='required_checks_missing' ? missingChecks.length?`required checks are missing: ${missingChecks.join(', ')}`:'no required checks were reported'
+  : result.reason==='merge_blocked' ? `GitHub reports merge state ${result.view.mergeStateStatus}`
+  : result.reason;
+ const message=result.result==='merged'?detail:`Merge failed for PR #${pr.number} at ${result.view.headRefOid}: ${detail}`;
+ try {
+  // --json must precede positional arguments for the comment command.
+  await run('tines',['issues','comment','--json',ref,message]);
+ } catch(error) {
+  // Match github-checks: comments are explanatory, but must not block the transition.
+  console.error('[github-merge] Warning: could not post merge comment:',error instanceof Error?error.message:String(error));
+ }
  await tines('issues','move',ref,action);
 } catch(e) {console.error('[github-merge]',e);process.exitCode=1;}
