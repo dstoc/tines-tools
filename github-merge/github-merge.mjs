@@ -60,10 +60,7 @@ try {
    else if(!checks.length||expected.some(x=>!checks.some(c=>c.name===x))) {
     missingSince??=Date.now();
     if(Date.now()-missingSince>=grace) reason='required_checks_missing';
-   } else {
-    missingSince=null;
-    if(!checks.some(x=>!['pass','skipping'].includes(x.bucket))&&view.mergeStateStatus==='BLOCKED') reason='merge_blocked';
-   }
+   } else missingSince=null;
   }
   if(reason&&reason===previousFailure){result={result:'failed',reason,view,checks};break;}
   previousFailure=reason;
@@ -90,7 +87,6 @@ try {
   : result.reason==='approval_missing' ? `required approval is missing (${result.view.reviewDecision||'unknown review state'})`
   : result.reason==='required_checks_failed' ? `required checks failed${failedChecks.length?`: ${failedChecks.join(', ')}`:''}`
   : result.reason==='required_checks_missing' ? missingChecks.length?`required checks are missing: ${missingChecks.join(', ')}`:'no required checks were reported'
-  : result.reason==='merge_blocked' ? `GitHub reports merge state ${result.view.mergeStateStatus}`
   : result.reason;
  const message=result.result==='merged'?detail:`Merge failed for PR #${pr.number} at ${result.view.headRefOid}: ${detail}`;
  try {
