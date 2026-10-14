@@ -23,7 +23,8 @@ const mode=process.env.MODE;
 const n=Number(fs.existsSync(process.env.COUNT)&&fs.readFileSync(process.env.COUNT,'utf8'))||0;
 if(a[1]==='view'){
 fs.writeFileSync(process.env.COUNT,String(n+1));
-console.log(JSON.stringify({number:123,url:'https://github.com/acme/app/pull/123',state:mode==='merged'||mode==='eventually_merged'&&n>0?'MERGED':mode==='closed'?'CLOSED':'OPEN',headRefOid:'a'.repeat(40),baseRefName:'main',mergedAt:null,mergeCommit:null,isDraft:mode==='draft',mergeable:mode==='conflict'?'CONFLICTING':'MERGEABLE',mergeStateStatus:mode==='blocked'?'BLOCKED':mode==='behind'?'BEHIND':'CLEAN',autoMergeRequest:mode==='no_auto'?null:{enabledAt:'2026-10-08'},reviewDecision:mode==='no_approval'?'REVIEW_REQUIRED':'APPROVED'}));
+const merged=mode==='merged'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2;
+console.log(JSON.stringify({number:123,url:'https://github.com/acme/app/pull/123',state:merged?'MERGED':mode==='closed'?'CLOSED':'OPEN',headRefOid:'a'.repeat(40),baseRefName:'main',mergedAt:null,mergeCommit:null,isDraft:mode==='draft',mergeable:mode==='conflict'?'CONFLICTING':'MERGEABLE',mergeStateStatus:mode==='blocked'||mode==='blocked_then_merged'?'BLOCKED':mode==='behind'?'BEHIND':'CLEAN',autoMergeRequest:mode==='no_auto'?null:{enabledAt:'2026-10-08'},reviewDecision:mode==='no_approval'?'REVIEW_REQUIRED':'APPROVED'}));
 }else if(a[1]==='checks'){
 const bucket=mode==='failed_checks'?'fail':mode==='pending'?'pending':'pass';
 console.log(JSON.stringify(mode==='missing_checks'?[]:[{name:'build',state:'SUCCESS',bucket,link:null}]));
@@ -46,6 +47,7 @@ return {r,events,report};
 for(const [mode,action,reason,comment] of [
  ['merged','Merged','merged','PR #123 merged from'],
  ['eventually_merged','Merged','merged','PR #123 merged from'],
+ ['blocked_then_merged','Merged','merged','PR #123 merged from'],
  ['conflict','Merge failed','merge_conflict','merge conflicts with main'],
  ['closed','Merge failed','closed_without_merge','closed without merging'],
  ['draft','Merge failed','draft_pr','still a draft'],
@@ -53,11 +55,10 @@ for(const [mode,action,reason,comment] of [
  ['no_approval','Merge failed','approval_missing','required approval is missing'],
  ['failed_checks','Merge failed','required_checks_failed','required checks failed: build'],
  ['missing_checks','Merge failed','required_checks_missing','no required checks were reported'],
- ['blocked','Merge failed','merge_blocked','GitHub reports merge state BLOCKED'],
 ]){
 test(mode,async()=>{const {r,events,report}=await simulate(mode);assert.equal(r.status,0,r.stderr);assert.equal(report.reason,reason);const moveIndex=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='move');const commentIndex=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='comment');assert.ok(moveIndex>=0);assert.ok(commentIndex>=0);assert.ok(commentIndex<moveIndex);assert.ok(events[commentIndex].args[3].includes(comment),events[commentIndex].args[3]);assert.equal(events[moveIndex].args[3],action);assert.ok(events.findIndex(x=>x.bin==='tines'&&x.args[2]==='attach')<commentIndex);});
 }
 test('comment failure does not block transition',async()=>{const {r,events}=await simulate('merged',{commentFail:true});assert.equal(r.status,0,r.stderr);assert.ok(events.some(x=>x.bin==='tines'&&x.args[1]==='comment'));assert.ok(events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merged'));});
-for(const mode of ['pending','behind']){
+for(const mode of ['pending','behind','blocked']){
 test(mode+' times out without transition',async()=>{const {r,events}=await simulate(mode);assert.notEqual(r.status,0);assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'));assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='comment'));});
 }
