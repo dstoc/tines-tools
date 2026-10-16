@@ -23,13 +23,19 @@ const mode=process.env.MODE;
 const n=Number(fs.existsSync(process.env.COUNT)&&fs.readFileSync(process.env.COUNT,'utf8'))||0;
 if(a[1]==='view'){
 fs.writeFileSync(process.env.COUNT,String(n+1));
-const merged=mode==='merged'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2;
+const merged=mode==='merged'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2||mode==='prerequisite_checks_then_merged'&&n>2;
 console.log(JSON.stringify({number:123,url:'https://github.com/acme/app/pull/123',state:merged?'MERGED':mode==='closed'?'CLOSED':'OPEN',headRefOid:'a'.repeat(40),baseRefName:'main',mergedAt:null,mergeCommit:null,isDraft:mode==='draft',mergeable:mode==='conflict'?'CONFLICTING':'MERGEABLE',mergeStateStatus:mode==='blocked'||mode==='blocked_then_merged'?'BLOCKED':mode==='behind'?'BEHIND':'CLEAN',autoMergeRequest:mode==='no_auto'?null:{enabledAt:'2026-10-08'},reviewDecision:mode==='no_approval'?'REVIEW_REQUIRED':'APPROVED'}));
 }else if(a[1]==='checks'){
-const bucket=mode==='failed_checks'?'fail':mode==='pending'?'pending':'pass';
-console.log(JSON.stringify(mode==='missing_checks'?[]:[{name:'build',state:'SUCCESS',bucket,link:null}]));
-if(bucket==='fail') process.exit(1);
-if(bucket==='pending') process.exit(8);
+const required=a.includes('--required');
+if(mode==='prerequisite_checks_then_merged'){
+ console.log(JSON.stringify(required?[]:[{name:'prerequisite',state:'IN_PROGRESS',bucket:'pending',link:null}]));
+ if(!required) process.exit(8);
+}else{
+ const bucket=mode==='failed_checks'?'fail':mode==='pending'?'pending':'pass';
+ console.log(JSON.stringify(mode==='missing_checks'?[]:[{name:'build',state:'SUCCESS',bucket,link:null}]));
+ if(bucket==='fail') process.exit(1);
+ if(bucket==='pending') process.exit(8);
+}
 }else process.exit(3);
 `;
 async function simulate(mode,{commentFail=false}={}){
@@ -48,6 +54,7 @@ for(const [mode,action,reason,comment] of [
  ['merged','Merged','merged','PR #123 merged from'],
  ['eventually_merged','Merged','merged','PR #123 merged from'],
  ['blocked_then_merged','Merged','merged','PR #123 merged from'],
+ ['prerequisite_checks_then_merged','Merged','merged','PR #123 merged from'],
  ['conflict','Merge failed','merge_conflict','merge conflicts with main'],
  ['closed','Merge failed','closed_without_merge','closed without merging'],
  ['draft','Merge failed','draft_pr','still a draft'],
