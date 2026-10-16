@@ -35,6 +35,19 @@ const expected=(process.env.EXPECTED_CHECKS||'').split(',').filter(Boolean);
 const interval=envNum('POLL_INTERVAL_SECONDS',5)*1000;
 const grace=envNum('MISSING_CHECK_GRACE_SECONDS',30)*1000;
 const deadline=Date.now()+envNum('MERGE_TIMEOUT_SECONDS',1200)*1000;
+const getChecks=async(required)=>{
+ const args=['pr','checks',String(pr.number),'-R',pr.repo];
+ if(required) args.push('--required');
+ args.push('--json','name,state,bucket,link');
+ const checkRun=await exec('gh',args,{maxBuffer:16*1024*1024,timeout:30000}).catch(e=>{
+  if([1,8].includes(e.code)&&e.stdout) return {stdout:e.stdout};
+  if(e.code===1&&/no (required )?checks reported/i.test(e.stderr||'')) return {stdout:'[]'};
+  throw e;
+ });
+ const checks=JSON.parse(checkRun.stdout);
+ if(!Array.isArray(checks)) throw new Error('Invalid checks response');
+ return checks;
+};
 let missingSince=null,head=null,previousFailure=null,result=null;
 try {
  while(Date.now()<deadline) {
@@ -49,17 +62,15 @@ try {
   else if(!view.autoMergeRequest) reason='auto_merge_disabled';
   else if(view.reviewDecision!=='APPROVED') reason='approval_missing';
   else {
-   const checkRun=await exec('gh',['pr','checks',String(pr.number),'-R',pr.repo,'--required','--json','name,state,bucket,link'],{maxBuffer:16*1024*1024,timeout:30000}).catch(e=>{
-    if([1,8].includes(e.code)&&e.stdout) return {stdout:e.stdout};
-    if(e.code===1&&/no (required )?checks reported/i.test(e.stderr||'')) return {stdout:'[]'};
-    throw e;
-   });
-   checks=JSON.parse(checkRun.stdout);
-   if(!Array.isArray(checks)) throw new Error('Invalid checks response');
+   checks=await getChecks(true);
    if(checks.some(x=>['fail','cancel'].includes(x.bucket))) reason='required_checks_failed';
    else if(!checks.length||expected.some(x=>!checks.some(c=>c.name===x))) {
-    missingSince??=Date.now();
-    if(Date.now()-missingSince>=grace) reason='required_checks_missing';
+    const allChecks=await getChecks(false);
+    if(allChecks.some(x=>x.bucket==='pending')) missingSince=null;
+    else {
+     missingSince??=Date.now();
+     if(Date.now()-missingSince>=grace) reason='required_checks_missing';
+    }
    } else missingSince=null;
   }
   if(reason&&reason===previousFailure){result={result:'failed',reason,view,checks};break;}
