@@ -184,7 +184,7 @@ async function prView(pr) {
 }
 
 function mergedVerdict(view) {
-  return { result: 'merged', reason: 'already_merged', summary: null, checks: [],
+  return { result: 'merged', reason: 'already_merged_needs_reconciliation', summary: null, checks: [],
     merge: { merged_at: view.mergedAt, commit_sha: view.mergeCommit.oid } };
 }
 
@@ -532,16 +532,15 @@ async function main() {
   const currentIssue = await tines('issues', 'show', ref);
   if (currentIssue.state?.id !== initialStateId)
     throw new Error(`Issue ${ref} moved from its original state; report attached but not transitioning`);
-  const action = result.result === 'merged' ? 'Merged' : ACTIONS[result.result];
-  const canTransition = currentIssue.allowed_transitions?.some((t) => t.name === action);
-  if (!canTransition && result.result !== 'merged')
+  const action = result.result === 'merged' ? ACTIONS.infrastructure_failed : ACTIONS[result.result];
+  if (!currentIssue.allowed_transitions?.some((t) => t.name === action))
     throw new Error(`Transition '${action}' no longer available; report attached but issue unchanged`);
   if (result.result === 'passed' || result.result === 'failed' || result.result === 'merged') {
     const status = result.reason === 'merge_conflict' ? 'BLOCKED' : result.result.toUpperCase();
     const detail = result.reason === 'merge_conflict'
       ? `: merge conflicts with ${result.pr.base_ref}` : '';
     const message = result.result === 'merged'
-      ? `PR #${result.pr.number} already merged at ${result.merge.merged_at} as ${result.merge.commit_sha}. No check-pass result is inferred.${canTransition ? '' : ' Manual workflow reconciliation is needed: this state has no Merged transition.'}`
+      ? `PR #${result.pr.number} already merged at ${result.merge.merged_at} as ${result.merge.commit_sha}. Manual workflow reconciliation is needed. Escalating through the existing Infrastructure failed transition; this is not a CI failure and no check-pass result is inferred.`
       : `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}${detail}`;
     try {
       // --json precedes positional arguments: the comment CLI passes through trailing options.
@@ -552,8 +551,6 @@ async function main() {
       say(`Warning: could not post status comment: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (!canTransition)
-    throw new Error('PR already merged; report attached. Configure an explicit Merged transition to completion or reconcile the issue manually; issue unchanged.');
   await tines('issues', 'move', ref, action);
   say(`${ref}: ${action} (${result.reason})`);
 }
