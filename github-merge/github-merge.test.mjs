@@ -20,11 +20,17 @@ const fs=require('node:fs');
 const a=process.argv.slice(2);
 fs.appendFileSync(process.env.LOG,JSON.stringify({bin:'gh',args:a})+'\\n');
 const mode=process.env.MODE;
+const samples=JSON.parse(process.env.SAMPLES||'null');
 const n=Number(fs.existsSync(process.env.COUNT)&&fs.readFileSync(process.env.COUNT,'utf8'))||0;
 if(a[1]==='view'){
 fs.writeFileSync(process.env.COUNT,String(n+1));
+if(samples){ console.log(JSON.stringify(samples[Math.min(n,samples.length-1)].view)); } else {
 const merged=mode==='merged'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2||mode==='prerequisite_checks_then_merged'&&n>2;
 console.log(JSON.stringify({number:123,url:'https://github.com/acme/app/pull/123',state:merged?'MERGED':mode==='closed'?'CLOSED':'OPEN',headRefOid:'a'.repeat(40),baseRefName:'main',mergedAt:null,mergeCommit:null,isDraft:mode==='draft',mergeable:mode==='conflict'?'CONFLICTING':'MERGEABLE',mergeStateStatus:mode==='blocked'||mode==='blocked_then_merged'?'BLOCKED':mode==='behind'?'BEHIND':'CLEAN',autoMergeRequest:mode==='no_auto'?null:{enabledAt:'2026-10-08'},reviewDecision:mode==='no_approval'?'REVIEW_REQUIRED':'APPROVED'}));
+}
+}else if(a[0]==='api'){
+if(a[1]!=='repos/acme/app/pulls/123') process.exit(3);
+console.log(JSON.stringify(samples?samples[Math.min(n-1,samples.length-1)].pull:{number:123,state:'open',merged:false,head:{sha:'a'.repeat(40)},base:{ref:'main'},mergeable_state:'behind',rebaseable:true}));
 }else if(a[1]==='checks'){
 const required=a.includes('--required');
 if(mode==='prerequisite_checks_then_merged'){
@@ -38,13 +44,13 @@ if(mode==='prerequisite_checks_then_merged'){
 }
 }else process.exit(3);
 `;
-async function simulate(mode,{commentFail=false}={}){
+async function simulate(mode,{commentFail=false,samples=null}={}){
 const dir=await mkdtemp(join(tmpdir(),'merge-test-'));
 try{
 const bin=join(dir,'bin');await mkdir(bin);
 for(const [name,src] of [['tines',mockTines],['gh',mockGh]]){const p=join(bin,name);await writeFile(p,src);await chmod(p,0o755);}
 const log=join(dir,'log');await writeFile(log,'');
-const r=spawnSync(process.execPath,[script,'--issue','demo/4','--workspace',dir],{encoding:'utf8',timeout:10000,env:{...process.env,PATH:bin+':'+process.env.PATH,LOG:log,COUNT:join(dir,'count'),MODE:mode,COMMENT_FAIL:commentFail?'1':'0',MERGE_TIMEOUT_SECONDS:'0.8',POLL_INTERVAL_SECONDS:'0.05',MISSING_CHECK_GRACE_SECONDS:'0'}});
+const r=spawnSync(process.execPath,[script,'--issue','demo/4','--workspace',dir],{encoding:'utf8',timeout:10000,env:{...process.env,PATH:bin+':'+process.env.PATH,LOG:log,COUNT:join(dir,'count'),MODE:mode,SAMPLES:JSON.stringify(samples),COMMENT_FAIL:commentFail?'1':'0',MERGE_TIMEOUT_SECONDS:samples?'3':'0.8',POLL_INTERVAL_SECONDS:'0.05',MISSING_CHECK_GRACE_SECONDS:'0'}});
 const events=(await readFile(log,'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
 let report=null;try{report=JSON.parse(await readFile(join(dir,'github-merge-status.json'),'utf8'));}catch{}
 return {r,events,report};
@@ -69,3 +75,42 @@ test('comment failure does not block transition',async()=>{const {r,events}=awai
 for(const mode of ['pending','behind','blocked']){
 test(mode+' times out without transition',async()=>{const {r,events}=await simulate(mode);assert.notEqual(r.status,0);assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'));assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='comment'));});
 }
+
+const sample=(rebaseable,{head='a',base='main',view={},pull={}}={})=>({
+ view:{number:123,state:'OPEN',headRefOid:head.repeat(40),baseRefName:base,mergedAt:null,isDraft:false,mergeable:'MERGEABLE',mergeStateStatus:'BEHIND',autoMergeRequest:{},reviewDecision:'APPROVED',...view},
+ pull:{number:123,state:'open',merged:false,head:{sha:head.repeat(40)},base:{ref:base},mergeable_state:'behind',rebaseable,...pull},
+});
+const mergedSample=sample(true,{view:{state:'MERGED'}});
+test('persistent non-rebaseable behind branch reports and transitions',async()=>{
+ const {r,events,report}=await simulate('rebase',{samples:[sample(false)]});
+ assert.equal(r.status,0,r.stderr);
+ assert.equal(report.reason,'rebase_conflict');
+ assert.equal(report.view.rebaseable,false);
+ assert.equal(events.filter(x=>x.bin==='gh'&&x.args[1]==='view').length,2);
+ assert.equal(events.filter(x=>x.bin==='gh'&&x.args[0]==='api').length,2);
+ const attach=events.findIndex(x=>x.bin==='tines'&&x.args[2]==='attach');
+ const comment=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='comment');
+ const move=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='move');
+ assert.ok(attach>=0&&attach<comment&&comment<move);
+ assert.match(events[comment].args[3],/behind main.*cannot be rebased/);
+ assert.equal(events[move].args[3],'Merge failed');
+});
+for(const [name,samples] of [
+ ['rebaseable',[sample(true),sample(true),mergedSample]],
+ ['unknown',[sample(null),sample(null),mergedSample]],
+ ['omitted',[sample(undefined),sample(undefined),mergedSample]],
+ ['transient false',[sample(false),sample(true),mergedSample]],
+ ['unknown resets failure',[sample(false),sample(null),sample(false),mergedSample]],
+ ['changed head',[sample(false),sample(false,{head:'b'}),mergedSample]],
+ ['changed target',[sample(false),sample(false,{base:'other'}),mergedSample]],
+ ['stale REST head',[sample(false),sample(false,{pull:{head:{sha:'b'.repeat(40)}}}),mergedSample]],
+ ['stale REST target',[sample(false),sample(false,{pull:{base:{ref:'other'}}}),mergedSample]],
+ ['REST no longer behind',[sample(false),sample(false,{pull:{mergeable_state:'clean'}}),mergedSample]],
+ ['REST closed',[sample(false),sample(false,{pull:{state:'closed'}}),mergedSample]],
+ ['REST merged',[sample(false),sample(false,{pull:{merged:true}}),mergedSample]],
+]) test(name+' waits for merge',async()=>{
+ const {r,report,events}=await simulate('rebase',{samples});
+ assert.equal(r.status,0,r.stderr);
+ assert.equal(report.reason,'merged');
+ assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merge failed'));
+});
