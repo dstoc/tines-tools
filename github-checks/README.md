@@ -6,7 +6,7 @@ A dependency-free Node.js custom harness for Tines. It reads a PR artifact from 
 
 - Node.js 20 or newer; the `tines` and `gh` CLIs on the runner's `PATH`.
 - An authenticated `gh` session for the **OS user running the Tines daemon**, with permission to read PRs and checks on the relevant repositories (`gh auth status`).
-- A Tines workflow state exposing the three transitions **Checks passed**, **Checks failed**, and **Infrastructure failed**. Route that state to this custom runner.
+- A Tines workflow state exposing the three transitions **Checks passed**, **Checks failed**, and **Infrastructure failed**. Route that state to this custom runner. Optionally expose a **Merged** transition to the workflow completion state for PRs that have already merged; this is separate from Checks passed and must be configured explicitly.
 - A PR artifact named `pr` by default (set `PR_ARTIFACT_NAME` to choose another slot). The runner checks that its repository is among the effective `repos.json` entries when any are configured.
 
 Install the runner on a machine with a copy of this directory, adjusting the script path:
@@ -22,16 +22,19 @@ The Tines daemon substitutes and shell-quotes the placeholders, sets `TINES_API_
 
 ## Behaviour
 
-1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status and HEAD SHA. Check mergeability before waiting for checks.
+1. Read the Tines issue and PR artifact; validate its GitHub repository, PR number, open/non-draft status (or verified merged state) and HEAD SHA. Check mergeability before waiting for checks.
 2. If the PR has merge conflicts (`mergeable: CONFLICTING` or `mergeStateStatus: DIRTY`), immediately classify it as `failed` with reason `merge_conflict`. Otherwise wait for required checks using `gh pr checks --required --watch`, periodically rechecking mergeability. Optionally require specific check names when checks register asynchronously.
-3. Re-check the PR's HEAD, mergeability, and artifact version to avoid publishing a passing result for a superseded or newly conflicting PR.
+3. Re-check the PR's HEAD, target branch, merge state, mergeability, and artifact version before publishing. If the head or target changes, restart observation within the original timeout; do not publish the old checks. If GitHub reports MERGED, require a valid merge timestamp and merge commit SHA and record `merged` / `already_merged` rather than inferring that checks passed.
 4. Upload `github-status-checks.json` as the `github-status-checks` **file** artifact with `application/json`. When required GitHub Actions checks fail, best-effort fetch failed-step logs with `gh run view --log-failed` and attach them separately as the `github-status-check-logs` text artifact (up to 5 MiB combined). External CI links are skipped; log fetch or attachment errors are warnings and never block the workflow result. For `passed` or `failed`, post a Tines issue comment containing the result, PR number and full HEAD SHA (for example, `Status checks PASSED for PR #163 at 579c27ba1becaa111e3b44dc5193cb59efb4db3e`). Then take exactly one transition. If attaching the primary report fails or the issue moved to another state, the runner exits non-zero **without commenting or transitioning**. Comment failures are logged but do not block the transition. Infrastructure failures do not generate a status comment. Merge conflicts generate `Status checks BLOCKED for PR #163 at <full-sha>: merge conflicts with main` and take `Checks failed` without waiting for checks that GitHub may never start.
 
 | Result | Transition | Meaning |
 | --- | --- | --- |
 | `passed` | Checks passed | All observed, selected checks completed successfully (skipped checks are neutral). |
 | `failed` | Checks failed | At least one check completed with a failure conclusion, or the PR has merge conflicts (reported as `merge_conflict`). |
-| `infrastructure_failed` | Infrastructure failed | Missing/invalid PR, cancelled or timed-out checks, GitHub/CLI errors, no checks, runner deadline, or superseded PR. |
+| `merged` | Merged, if explicitly available | GitHub reports MERGED with a valid timestamp and merge commit. Does not attest that checks passed. |
+| `infrastructure_failed` | Infrastructure failed | Missing/invalid PR, cancelled or timed-out checks, GitHub/CLI errors, no checks, runner deadline, or changed PR artifact. |
+
+For `merged`, the report includes `merge.merged_at` and `merge.commit_sha`, with no check verdict or counts. The runner comments with that evidence and takes **Merged** only if the current workflow state exposes it. If that action is absent, the runner attaches the merged report, comments that manual workflow reconciliation is needed, and exits non-zero without transitioning. It does not use Checks passed or Infrastructure failed as a substitute. Configure Merged to completion explicitly if automatic reconciliation is desired; the runner does not edit workflow definitions. Closed-but-unmerged PRs still fail validation, and OPEN PRs still require the normal check/review path.
 
 The report records the issue reference, PR and HEAD SHA, timestamp, per-check states/URLs and counts, overall result, and a machine-readable `reason` and `error` when applicable. On ordinary check failures, the optional `github-status-check-logs` artifact contains failed GitHub Actions output grouped by check/run; job-specific check URLs are fetched with `--job`, while run URLs fetch all failed steps for that run. This is diagnostic output only and may be truncated at 5 MiB. This is a process report, not an attestation; GitHub status can change after the final read.
 
