@@ -49,13 +49,13 @@ const getChecks=async(required)=>{
  return checks;
 };
 let missingSince=null,head=null,previousFailure=null,result=null;
-try {
- while(Date.now()<deadline) {
-  const view=await gh('pr','view',String(pr.number),'-R',pr.repo,'--json','number,state,headRefOid,baseRefName,mergedAt,mergeCommit,isDraft,mergeable,mergeStateStatus,autoMergeRequest,reviewDecision,url');
-  if(view.number!==pr.number) throw new Error('PR mismatch');
-  if(view.headRefOid!==head){head=view.headRefOid;missingSince=null;previousFailure=null;}
+const getView=async()=>{
+ const view=await gh('pr','view',String(pr.number),'-R',pr.repo,'--json','number,state,headRefOid,baseRefName,mergedAt,mergeCommit,isDraft,mergeable,mergeStateStatus,autoMergeRequest,reviewDecision,url');
+ if(view.number!==pr.number) throw new Error('PR mismatch');
+ return view;
+};
+const inspect=async(view)=>{
   let reason=null,checks=[];
-  if(view.state==='MERGED'||view.mergedAt) {result={result:'merged',reason:'merged',view,checks};break;}
   if(view.state!=='OPEN') reason='closed_without_merge';
   else if(view.isDraft) reason='draft_pr';
   else if(view.mergeable==='CONFLICTING'||view.mergeStateStatus==='DIRTY') reason='merge_conflict';
@@ -73,18 +73,27 @@ try {
     }
    } else missingSince=null;
   }
-  if(!reason&&view.mergeStateStatus==='BEHIND') {
-   // rebaseable is a REST field, not a gh pr view JSON field. Only use
-   // a matching, still-open snapshot; null/omitted means no evidence yet.
-   const pull=await gh('api',`repos/${pr.repo}/pulls/${pr.number}`);
-   if(pull.number!==pr.number) throw new Error('PR mismatch');
-   if(pull.state==='open'&&!pull.merged&&pull.head?.sha===view.headRefOid&&pull.base?.ref===view.baseRefName&&pull.mergeable_state==='behind') {
-    view.rebaseable=pull.rebaseable;
-    if(pull.rebaseable===false) reason='rebase_conflict';
-   }
-  }
+  return {reason,checks};
+};
+try {
+ while(Date.now()<deadline) {
+  const view=await getView();
+  if(view.headRefOid!==head){head=view.headRefOid;missingSince=null;previousFailure=null;}
+  if(view.state==='MERGED'||view.mergedAt) {result={result:'merged',reason:'merged',view,checks:[]};break;}
+  const {reason,checks}=await inspect(view);
   const failure=reason?JSON.stringify([reason,view.headRefOid,view.baseRefName]):null;
-  if(failure&&failure===previousFailure){result={result:'failed',reason,view,checks};break;}
+  if(failure&&failure===previousFailure) {
+   // Rebase/merge can complete between polls. Never publish the old failure
+   // without checking the current PR head, state and failure condition again.
+   const fresh=await getView();
+   if(fresh.state==='MERGED'||fresh.mergedAt) {result={result:'merged',reason:'merged',view:fresh,checks:[]};break;}
+   if(fresh.headRefOid!==view.headRefOid||fresh.baseRefName!==view.baseRefName) {
+    previousFailure=null;missingSince=null;continue;
+   }
+   const verified=await inspect(fresh);
+   if(verified.reason===reason) {result={result:'failed',reason,view:fresh,checks:verified.checks};break;}
+   previousFailure=null;continue;
+  }
   previousFailure=failure;
   await sleep(Math.min(interval,Math.max(0,deadline-Date.now())));
  }
@@ -103,7 +112,6 @@ try {
  const detail=result.reason==='merged'
   ? `PR #${pr.number} merged from ${result.view.headRefOid}`
   : result.reason==='merge_conflict' ? `merge conflicts with ${result.view.baseRefName}`
-  : result.reason==='rebase_conflict' ? `branch is behind ${result.view.baseRefName} and GitHub reports it cannot be rebased; update the branch to resolve the integration failure`
   : result.reason==='closed_without_merge' ? 'PR was closed without merging'
   : result.reason==='draft_pr' ? 'PR is still a draft'
   : result.reason==='auto_merge_disabled' ? 'auto-merge is disabled'

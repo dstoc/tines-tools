@@ -28,7 +28,7 @@ if (a[0] === 'issues' && a[1] === 'show') {
 } else if (event === 'issues artifacts list') {
   const count = Number(fs.existsSync(process.env.LIST_COUNTER) && fs.readFileSync(process.env.LIST_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.LIST_COUNTER, String(count + 1));
-  console.log(JSON.stringify({ items: process.env.MOCK_CASE === 'missing_pr' ? [] : [{ name: 'pr', artifact_type: 'pr', current_version: { version: process.env.MOCK_CASE === 'changed_artifact' && count > 0 ? 3 : 2, pr_repo_url: 'https://github.com/acme/app', pr_number: 123 } }] }));
+  console.log(JSON.stringify({ items: process.env.MOCK_CASE === 'missing_pr' ? [] : [{ name: 'pr', artifact_type: 'pr', current_version: { version: ['changed_artifact','merged_changed_artifact'].includes(process.env.MOCK_CASE) && count > 0 ? 3 : 2, pr_repo_url: 'https://github.com/acme/app', pr_number: 123 } }] }));
 } else if (event === 'issues artifacts attach') {
   if (process.env.MOCK_CASE === 'attach_fail') { console.error('forced attach failure'); process.exit(1); }
   console.log(JSON.stringify({ artifact_type: 'file', name: 'github-status-checks' }));
@@ -52,16 +52,18 @@ if (a[0] !== 'pr') process.exit(3);
 if (a[1] === 'view') {
   const count = Number(fs.existsSync(process.env.GH_COUNTER) && fs.readFileSync(process.env.GH_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.GH_COUNTER, String(count + 1));
-  console.log(JSON.stringify({ number: 123, url: 'https://github.com/acme/app/pull/123', state: 'OPEN', isDraft: process.env.MOCK_CASE === 'draft_pr',
-    headRefOid: process.env.MOCK_CASE === 'changed_head' && count > 0 ? 'b'.repeat(40) : 'a'.repeat(40), baseRefName: 'main',
+  const merged = ['merge_final_sleep','merge_final_watch','merge_check_error'].includes(process.env.MOCK_CASE) && count >= (process.env.MOCK_CASE==='merge_check_error'?1:2) || process.env.MOCK_CASE.startsWith('merged_') || process.env.MOCK_CASE === 'merged' || ['merge_after_checks','merge_pending'].includes(process.env.MOCK_CASE) && count > 0;
+  console.log(JSON.stringify({ number: 123, url: 'https://github.com/acme/app/pull/123', state: merged ? 'MERGED' : 'OPEN',
+    mergedAt: merged ? '2026-10-31T04:00:00Z' : null, mergeCommit: merged && process.env.MOCK_CASE !== 'merged_no_evidence' ? {oid:'c'.repeat(40)} : null, isDraft: process.env.MOCK_CASE === 'draft_pr',
+    headRefOid: ['changed_head','changed_head_failed'].includes(process.env.MOCK_CASE) && count > 0 ? 'b'.repeat(40) : 'a'.repeat(40), baseRefName: 'main',
     mergeable: ['conflict_initial', 'conflict_dirty'].includes(process.env.MOCK_CASE) ||
       ['conflict_no_checks', 'conflict_pending', 'conflict_after_checks'].includes(process.env.MOCK_CASE) && count > 0
       ? 'CONFLICTING' : process.env.MOCK_CASE === 'merge_unknown' ? 'UNKNOWN' : 'MERGEABLE',
     mergeStateStatus: process.env.MOCK_CASE === 'conflict_dirty' ? 'DIRTY' :
       process.env.MOCK_CASE === 'merge_blocked' ? 'BLOCKED' : 'CLEAN' }));
 } else if (a[1] === 'checks') {
-  if (a.includes('--watch')) { console.log('watching'); process.exit(0); }
-  if (process.env.MOCK_CASE === 'no_checks' || process.env.MOCK_CASE === 'conflict_no_checks') { console.log('[]'); process.exit(0); }
+  if (a.includes('--watch')) { if(process.env.MOCK_CASE==='merge_final_watch') {setTimeout(()=>process.exit(0),5000); return;} console.log('watching'); process.exit(0); }
+  if (process.env.MOCK_CASE === 'merge_final_sleep' || process.env.MOCK_CASE === 'no_checks' || process.env.MOCK_CASE === 'conflict_no_checks') { console.log('[]'); process.exit(0); }
   if (process.env.MOCK_CASE === 'no_checks_stderr') { console.error("no checks reported on the 'feature' branch"); process.exit(1); }
   if (process.env.MOCK_CASE === 'no_required_checks_stderr') { console.error("no required checks reported on the 'feature' branch"); process.exit(1); }
   if (process.env.MOCK_CASE === 'required_checks_late') {
@@ -69,16 +71,17 @@ if (a[1] === 'view') {
     fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
     if (count === 0) { console.error("no required checks reported on the 'feature' branch"); process.exit(1); }
   }
-  if (process.env.MOCK_CASE === 'gh_error') { console.error('GitHub network failure'); process.exit(4); }
+  if (['gh_error','merge_check_error'].includes(process.env.MOCK_CASE)) { console.error('GitHub network failure'); process.exit(4); }
   if (process.env.MOCK_CASE === 'late_checks') {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
     fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
     if (count === 0) { console.log('[]'); process.exit(0); }
   }
   let bucket = 'pass'; let state = 'SUCCESS'; let exit = 0;
-  if (['failed', 'failed_job', 'log_fetch_fail', 'external_failed'].includes(process.env.MOCK_CASE)) { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
+  if (['failed', 'failed_job', 'log_fetch_fail', 'external_failed','merge_after_checks'].includes(process.env.MOCK_CASE)) { bucket = 'fail'; state = 'FAILURE'; exit = 1; }
+  if (process.env.MOCK_CASE === 'changed_head_failed' && Number(fs.readFileSync(process.env.GH_COUNTER,'utf8')) === 1) { bucket='fail'; state='FAILURE'; exit=1; }
   if (process.env.MOCK_CASE === 'cancelled') { bucket = 'cancel'; state = 'CANCELLED'; exit = 1; }
-  if (process.env.MOCK_CASE === 'watch_pending' || process.env.MOCK_CASE === 'conflict_pending') {
+  if (['watch_pending','conflict_pending','merge_pending','merge_final_watch'].includes(process.env.MOCK_CASE)) {
     const count = Number(fs.existsSync(process.env.CHECK_COUNTER) && fs.readFileSync(process.env.CHECK_COUNTER, 'utf8')) || 0;
     fs.writeFileSync(process.env.CHECK_COUNTER, String(count + 1));
     if (count === 0) { bucket = 'pending'; state = 'IN_PROGRESS'; exit = 8; }
@@ -134,7 +137,7 @@ for (const [mode, status, action, reason] of [
   ['no_checks_stderr', 'infrastructure_failed', 'Infrastructure failed', 'no_checks'],
   ['no_required_checks_stderr', 'infrastructure_failed', 'Infrastructure failed', 'no_checks'],
   ['gh_error', 'infrastructure_failed', 'Infrastructure failed', 'checks_unavailable'],
-  ['changed_head', 'infrastructure_failed', 'Infrastructure failed', 'head_changed'],
+  ['changed_head', 'passed', 'Checks passed', 'all_checks_passed'],
   ['changed_artifact', 'infrastructure_failed', 'Infrastructure failed', 'pr_artifact_changed'],
   ['draft_pr', 'infrastructure_failed', 'Infrastructure failed', 'pr_not_ready'],
   ['missing_pr', 'infrastructure_failed', 'Infrastructure failed', 'pr_artifact_missing'],
@@ -154,11 +157,11 @@ for (const [mode, status, action, reason] of [
     assert.ok(attach >= 0 && move > attach, 'report attached before transition');
     assert.equal(events[move].args[3], action);
     const comment = events.findIndex((e) => e.binary === 'tines' && e.args[1] === 'comment');
-    if (mode === 'passed' || mode === 'failed' || mode === 'watch_pending') {
+    if (mode === 'passed' || mode === 'failed' || mode === 'watch_pending' || mode === 'changed_head') {
       assert.ok(comment > attach && comment < move, 'comment after report and before transition');
       assert.equal(events[comment].args[2], 'demo/4');
       assert.equal(events[comment].args[3],
-        `Status checks ${status.toUpperCase()} for PR #123 at ${sha}`);
+        `Status checks ${status.toUpperCase()} for PR #123 at ${mode === 'changed_head' ? 'b'.repeat(40) : sha}`);
     } else {
       assert.equal(comment, -1, 'do not comment on infrastructure failures');
     }
@@ -318,4 +321,39 @@ test('concurrent issue state change prevents transition', async () => {
   assert.ok(events.some((e) => e.binary === 'tines' && e.args[2] === 'attach'));
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'move'));
   assert.ok(!events.some((e) => e.binary === 'tines' && e.args[1] === 'comment'));
+});
+
+for (const mode of ['merged', 'merge_after_checks', 'merge_pending','merge_final_sleep','merge_final_watch','merge_check_error']) {
+  test(mode + ' records real merge evidence without claiming checks passed', async () => {
+    const {result, report, events} = await simulate(mode);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(report.result, 'merged');
+    assert.equal(report.reason, 'already_merged_needs_reconciliation');
+    assert.equal(report.merge.commit_sha, 'c'.repeat(40));
+    assert.equal(report.merge.merged_at, '2026-10-31T04:00:00Z');
+    assert.equal(report.summary, null);
+    assert.deepEqual(report.checks, []);
+    assert.equal(events.find(e=>e.binary==='tines'&&e.args[1]==='move').args[3], 'Infrastructure failed');
+    assert.match(events.find(e=>e.binary==='tines'&&e.args[1]==='comment').args[3], /already merged.*Manual workflow reconciliation.*not a CI failure.*no check-pass result is inferred/);
+    if(mode==='merged') assert.ok(!events.some(e=>e.binary==='gh'&&e.args[1]==='checks'));
+  });
+}
+for(const [mode,reason] of [['merged_no_evidence','merge_evidence_missing'],['merged_changed_artifact','pr_artifact_changed']]) {
+ test(mode+' never completes the issue',async()=>{
+  const {result,report,events}=await simulate(mode);
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(report.result,'infrastructure_failed');
+  assert.equal(report.reason,reason);
+  assert.equal(events.find(e=>e.binary==='tines'&&e.args[1]==='move').args[3],'Infrastructure failed');
+ });
+}
+
+test('head changed after failed checks restarts instead of publishing stale failure',async()=>{
+ const {result,report,events}=await simulate('changed_head_failed');
+ assert.equal(result.status,0,result.stderr);
+ assert.equal(report.result,'passed');
+ assert.equal(report.pr.head_sha,'b'.repeat(40));
+ assert.equal(events.filter(e=>e.binary==='gh'&&e.args[1]==='checks').length,2);
+ assert.equal(events.find(e=>e.binary==='tines'&&e.args[1]==='move').args[3],'Checks passed');
+ assert.ok(!events.some(e=>e.binary==='gh'&&e.args[0]==='run'));
 });
