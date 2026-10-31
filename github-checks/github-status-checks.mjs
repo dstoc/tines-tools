@@ -167,14 +167,25 @@ function prFromArtifacts(items, preferredName) {
 async function prView(pr) {
   const result = await jsonCommand('gh', [
     'pr', 'view', String(pr.number), '--repo', pr.repo,
-    '--json', 'number,url,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus',
+    '--json', 'number,url,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,mergedAt,mergeCommit',
   ]);
   if (result.number !== pr.number || result.url?.toLowerCase() !== pr.url.toLowerCase() ||
       !/^[0-9a-f]{40,64}$/i.test(result.headRefOid ?? ''))
     throw new OperationalError('pr_mismatch', 'GitHub returned an unexpected PR or invalid HEAD');
+  if (result.state === 'MERGED') {
+    if (!result.mergedAt || !Number.isFinite(Date.parse(result.mergedAt)) ||
+        !/^[0-9a-f]{40,64}$/i.test(result.mergeCommit?.oid ?? ''))
+      throw new OperationalError('merge_evidence_missing', 'Merged PR has no valid merge timestamp and commit');
+    return result;
+  }
   if (result.state !== 'OPEN' || result.isDraft)
     throw new OperationalError('pr_not_ready', `PR must be open and not draft (state=${result.state}, draft=${result.isDraft})`);
   return result;
+}
+
+function mergedVerdict(view) {
+  return { result: 'merged', reason: 'already_merged', summary: null, checks: [],
+    merge: { merged_at: view.mergedAt, commit_sha: view.mergeCommit.oid } };
 }
 
 function hasMergeConflicts(view) {
@@ -371,7 +382,7 @@ function classify(entries) {
 }
 
 async function waitForChecks(pr, config) {
-  const deadline = Date.now() + config.timeoutSeconds * 1000;
+  const deadline = config.deadline;
   let sawChecks = false;
   while (true) {
     if (Date.now() >= deadline)
@@ -384,7 +395,9 @@ async function waitForChecks(pr, config) {
     const missing = config.expected.filter((name) => !actualNames.has(name));
     if (!entries.length || missing.length) {
       // Checks may never register for a conflicting PR. Do not exhaust the CI deadline.
-      if (hasMergeConflicts(await prView(pr))) return conflictVerdict();
+      const current = await prView(pr);
+      if (current.state === 'MERGED') return mergedVerdict(current);
+      if (hasMergeConflicts(current)) return conflictVerdict();
       say(entries.length ? `Waiting for expected required checks: ${missing.join(', ')}` : 'Waiting for required checks to appear');
       await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
       continue;
@@ -394,7 +407,9 @@ async function waitForChecks(pr, config) {
 
     // A pending check can become blocked by a merge conflict. Recheck GitHub
     // before watching and cap each watch so conflicts are noticed promptly.
-    if (hasMergeConflicts(await prView(pr))) return conflictVerdict();
+    const current = await prView(pr);
+    if (current.state === 'MERGED') return mergedVerdict(current);
+    if (hasMergeConflicts(current)) return conflictVerdict();
     say(`Waiting for ${verdict.summary.pending} pending required check(s) on ${pr.url}`);
     const watched = await command('gh', [
       'pr', 'checks', String(pr.number), '--repo', pr.repo,
@@ -445,25 +460,46 @@ async function main() {
     const allowed = await allowedRepos(options.workspace);
     if (allowed.length && !allowed.includes(pr.repo))
       throw new OperationalError('pr_repo_mismatch', `PR repo ${pr.repo} not in effective issue repos: ${allowed.join(', ')}`);
-    const view = await prView(pr);
-    result.pr.head_sha = view.headRefOid;
-    result.pr.base_ref = view.baseRefName;
-    say(`Checking ${pr.url} at ${view.headRefOid.slice(0, 12)}`);
-    const verdict = hasMergeConflicts(view) ? conflictVerdict() : await waitForChecks(pr, config);
+    config.deadline = Date.now() + config.timeoutSeconds * 1000;
+    let verdict;
+    while (true) {
+      const view = await prView(pr);
+      result.pr.head_sha = view.headRefOid;
+      result.pr.base_ref = view.baseRefName;
+      say(`Checking ${pr.url} at ${view.headRefOid.slice(0, 12)}`);
+      try {
+        verdict = view.state === 'MERGED' ? mergedVerdict(view)
+          : hasMergeConflicts(view) ? conflictVerdict() : await waitForChecks(pr, config);
+      } catch (error) {
+        // Checks/watch can fail or exhaust the deadline just as GitHub merges.
+        // Only verified completion supersedes that observation error; artifact
+        // and issue-state validation still run below.
+        const current = await prView(pr);
+        if (current.state !== 'MERGED') throw error;
+        verdict = mergedVerdict(current);
+      }
+      // Revalidate before publishing: a rebase invalidates old checks, and a
+      // completed merge supersedes any earlier check/conflict result.
+      const after = await prView(pr);
+      if (after.state === 'MERGED') {
+        result.pr.head_sha = after.headRefOid;
+        result.pr.base_ref = after.baseRefName;
+        verdict = mergedVerdict(after);
+        break;
+      }
+      if (after.headRefOid !== view.headRefOid || after.baseRefName !== view.baseRefName ||
+          hasMergeConflicts(after) !== hasMergeConflicts(view) ||
+          verdict.reason === 'merge_conflict' && !hasMergeConflicts(after)) {
+        if (Date.now() >= config.deadline)
+          throw new OperationalError('checks_timeout', 'PR changed while checking; no stable result before the deadline');
+        say('PR changed while checking; restarting observation');
+        continue;
+      }
+      break;
+    }
     result.summary = verdict.summary;
     result.checks = verdict.checks;
-    // Reject results for a SHA that changed while gh was watching CI.
-    const after = await prView(pr);
-    if (after.headRefOid !== view.headRefOid)
-      throw new OperationalError('head_changed', `PR HEAD changed ${view.headRefOid} -> ${after.headRefOid}`);
-    // A PR can become conflicting while checks are running; don't report stale success.
-    if (hasMergeConflicts(after) && verdict.reason !== 'merge_conflict') {
-      const conflict = conflictVerdict();
-      result.summary = conflict.summary;
-      result.checks = conflict.checks;
-      verdict.result = conflict.result;
-      verdict.reason = conflict.reason;
-    }
+    if (verdict.merge) result.merge = verdict.merge;
     const latest = prFromArtifacts(
       (await tines('issues', 'artifacts', 'list', ref)).items ?? [], pr.artifact_name,
     );
@@ -496,14 +532,17 @@ async function main() {
   const currentIssue = await tines('issues', 'show', ref);
   if (currentIssue.state?.id !== initialStateId)
     throw new Error(`Issue ${ref} moved from its original state; report attached but not transitioning`);
-  const action = ACTIONS[result.result];
-  if (!currentIssue.allowed_transitions?.some((t) => t.name === action))
+  const action = result.result === 'merged' ? 'Merged' : ACTIONS[result.result];
+  const canTransition = currentIssue.allowed_transitions?.some((t) => t.name === action);
+  if (!canTransition && result.result !== 'merged')
     throw new Error(`Transition '${action}' no longer available; report attached but issue unchanged`);
-  if (result.result === 'passed' || result.result === 'failed') {
+  if (result.result === 'passed' || result.result === 'failed' || result.result === 'merged') {
     const status = result.reason === 'merge_conflict' ? 'BLOCKED' : result.result.toUpperCase();
     const detail = result.reason === 'merge_conflict'
       ? `: merge conflicts with ${result.pr.base_ref}` : '';
-    const message = `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}${detail}`;
+    const message = result.result === 'merged'
+      ? `PR #${result.pr.number} already merged at ${result.merge.merged_at} as ${result.merge.commit_sha}. No check-pass result is inferred.${canTransition ? '' : ' Manual workflow reconciliation is needed: this state has no Merged transition.'}`
+      : `Status checks ${status} for PR #${result.pr.number} at ${result.pr.head_sha}${detail}`;
     try {
       // --json precedes positional arguments: the comment CLI passes through trailing options.
       await jsonCommand('tines', ['issues', 'comment', '--json', ref, message]);
@@ -513,6 +552,8 @@ async function main() {
       say(`Warning: could not post status comment: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  if (!canTransition)
+    throw new Error('PR already merged; report attached. Configure an explicit Merged transition to completion or reconcile the issue manually; issue unchanged.');
   await tines('issues', 'move', ref, action);
   say(`${ref}: ${action} (${result.reason})`);
 }
