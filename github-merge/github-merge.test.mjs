@@ -11,7 +11,7 @@ const fs=require('node:fs');
 const a=process.argv.slice(2).filter(x=>x!=='--json');
 fs.appendFileSync(process.env.LOG,JSON.stringify({bin:'tines',args:a})+'\\n');
 if(a[0]==='issues'&&a[1]==='show') console.log(JSON.stringify({state:{id:'waiting'},allowed_transitions:[{name:'Merged'},{name:'Merge failed'}]}));
-else if(a[0]==='issues'&&a[1]==='artifacts'&&a[2]==='list') console.log(JSON.stringify({items:[{name:'pr',artifact_type:'pr',current_version:{version:1,pr_repo_url:'https://github.com/acme/app',pr_number:123}}]}));
+else if(a[0]==='issues'&&a[1]==='artifacts'&&a[2]==='list') console.log(JSON.stringify({items:[{name:'pr',artifact_type:'pr',current_version:{version:process.env.MODE==='changed_artifact'&&fs.existsSync(process.env.COUNT)?2:1,pr_repo_url:'https://github.com/acme/app',pr_number:123}}]}));
 else if(a[0]==='issues'&&a[1]==='comment'&&process.env.COMMENT_FAIL==='1') {console.error('comment failed');process.exit(1);}
 else console.log('{}');
 `;
@@ -25,7 +25,7 @@ const n=Number(fs.existsSync(process.env.COUNT)&&fs.readFileSync(process.env.COU
 if(a[1]==='view'){
 fs.writeFileSync(process.env.COUNT,String(n+1));
 if(samples){ console.log(JSON.stringify(samples[Math.min(n,samples.length-1)].view)); } else {
-const merged=mode==='merged'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2||mode==='prerequisite_checks_then_merged'&&n>2;
+const merged=mode==='merged'||mode==='changed_artifact'||mode==='eventually_merged'&&n>0||mode==='blocked_then_merged'&&n>2||mode==='prerequisite_checks_then_merged'&&n>2;
 console.log(JSON.stringify({number:123,url:'https://github.com/acme/app/pull/123',state:merged?'MERGED':mode==='closed'?'CLOSED':'OPEN',headRefOid:'a'.repeat(40),baseRefName:'main',mergedAt:null,mergeCommit:null,isDraft:mode==='draft',mergeable:mode==='conflict'?'CONFLICTING':'MERGEABLE',mergeStateStatus:mode==='blocked'||mode==='blocked_then_merged'?'BLOCKED':mode==='behind'?'BEHIND':'CLEAN',autoMergeRequest:mode==='no_auto'?null:{enabledAt:'2026-10-08'},reviewDecision:mode==='no_approval'?'REVIEW_REQUIRED':'APPROVED'}));
 }
 }else if(a[0]==='api'){
@@ -81,36 +81,46 @@ const sample=(rebaseable,{head='a',base='main',view={},pull={}}={})=>({
  pull:{number:123,state:'open',merged:false,head:{sha:head.repeat(40)},base:{ref:base},mergeable_state:'behind',rebaseable,...pull},
 });
 const mergedSample=sample(true,{view:{state:'MERGED'}});
-test('persistent non-rebaseable behind branch reports and transitions',async()=>{
- const {r,events,report}=await simulate('rebase',{samples:[sample(false)]});
+test('persistent non-rebaseable signal does not fail before a successful rebase',async()=>{
+ const {r,events,report}=await simulate('rebase',{samples:[sample(false),sample(false),sample(false),sample(true,{head:'b'}),mergedSample]});
  assert.equal(r.status,0,r.stderr);
- assert.equal(report.reason,'rebase_conflict');
- assert.equal(report.view.rebaseable,false);
- assert.equal(events.filter(x=>x.bin==='gh'&&x.args[1]==='view').length,2);
- assert.equal(events.filter(x=>x.bin==='gh'&&x.args[0]==='api').length,2);
- const attach=events.findIndex(x=>x.bin==='tines'&&x.args[2]==='attach');
- const comment=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='comment');
- const move=events.findIndex(x=>x.bin==='tines'&&x.args[1]==='move');
- assert.ok(attach>=0&&attach<comment&&comment<move);
- assert.match(events[comment].args[3],/behind main.*cannot be rebased/);
- assert.equal(events[move].args[3],'Merge failed');
+ assert.equal(report.reason,'merged');
+ assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merge failed'));
 });
 for(const [name,samples] of [
- ['rebaseable',[sample(true),sample(true),mergedSample]],
- ['unknown',[sample(null),sample(null),mergedSample]],
- ['omitted',[sample(undefined),sample(undefined),mergedSample]],
- ['transient false',[sample(false),sample(true),mergedSample]],
- ['unknown resets failure',[sample(false),sample(null),sample(false),mergedSample]],
+ ['ordinary behind',[sample(true),sample(true),mergedSample]],
  ['changed head',[sample(false),sample(false,{head:'b'}),mergedSample]],
  ['changed target',[sample(false),sample(false,{base:'other'}),mergedSample]],
- ['stale REST head',[sample(false),sample(false,{pull:{head:{sha:'b'.repeat(40)}}}),mergedSample]],
- ['stale REST target',[sample(false),sample(false,{pull:{base:{ref:'other'}}}),mergedSample]],
- ['REST no longer behind',[sample(false),sample(false,{pull:{mergeable_state:'clean'}}),mergedSample]],
- ['REST closed',[sample(false),sample(false,{pull:{state:'closed'}}),mergedSample]],
- ['REST merged',[sample(false),sample(false,{pull:{merged:true}}),mergedSample]],
 ]) test(name+' waits for merge',async()=>{
  const {r,report,events}=await simulate('rebase',{samples});
  assert.equal(r.status,0,r.stderr);
  assert.equal(report.reason,'merged');
  assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merge failed'));
+});
+
+const conflictSample=sample(true,{view:{mergeable:'CONFLICTING',mergeStateStatus:'DIRTY'}});
+for(const [name,samples] of [
+ ['merge before failure publication',[conflictSample,conflictSample,mergedSample]],
+ ['rebase before failure publication',[conflictSample,conflictSample,sample(true,{head:'b'}),mergedSample]],
+ ['conflict disappears before publication',[conflictSample,conflictSample,sample(true),mergedSample]],
+]) test(name,async()=>{
+ const {r,report,events}=await simulate('race',{samples});
+ assert.equal(r.status,0,r.stderr);
+ assert.equal(report.reason,'merged');
+ assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'&&x.args[3]==='Merge failed'));
+});
+test('confirmed conflict is revalidated before failure report',async()=>{
+ const {r,report,events}=await simulate('race',{samples:[conflictSample]});
+ assert.equal(r.status,0,r.stderr);
+ assert.equal(report.reason,'merge_conflict');
+ assert.equal(events.filter(x=>x.bin==='gh'&&x.args[1]==='view').length,3);
+ assert.equal(events.find(x=>x.bin==='tines'&&x.args[1]==='move').args[3],'Merge failed');
+});
+
+test('changed PR artifact prevents stale completion',async()=>{
+ const {r,events,report}=await simulate('changed_artifact');
+ assert.notEqual(r.status,0);
+ assert.match(r.stderr,/PR artifact changed/);
+ assert.equal(report,null);
+ assert.ok(!events.some(x=>x.bin==='tines'&&x.args[1]==='move'));
 });
