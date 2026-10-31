@@ -13,7 +13,6 @@ const a = process.argv.slice(2).filter((s) => s !== '--json');
 const event = a.slice(0, 3).join(' ');
 fs.appendFileSync(process.env.EVENT_LOG, JSON.stringify({ binary: 'tines', args: a }) + '\\n');
 const actions = ['Checks passed', 'Checks failed', 'Infrastructure failed'];
-if (process.env.MERGED_ACTION === '1') actions.push('Merged');
 if (a[0] === 'issues' && a[1] === 'show') {
   const count = Number(fs.existsSync(process.env.SHOW_COUNTER) && fs.readFileSync(process.env.SHOW_COUNTER, 'utf8')) || 0;
   fs.writeFileSync(process.env.SHOW_COUNTER, String(count + 1));
@@ -98,7 +97,7 @@ if (a[1] === 'view') {
 } else { console.error('unexpected gh command:', a); process.exit(3); }
 `;
 
-async function simulate(mode, { timeoutSeconds = 2, expected = '', mergedAction = false } = {}) {
+async function simulate(mode, { timeoutSeconds = 2, expected = '' } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tines-check-test-'));
   const bin = join(dir, 'bin');
   const ws = join(dir, 'workspace');
@@ -115,7 +114,7 @@ async function simulate(mode, { timeoutSeconds = 2, expected = '', mergedAction 
       EVENT_LOG: join(dir, 'events.jsonl'), SHOW_COUNTER: join(dir, 'show_count'),
       GH_COUNTER: join(dir, 'gh_count'), CHECK_COUNTER: join(dir, 'check_count'),
       LIST_COUNTER: join(dir, 'list_count'),
-      MOCK_CASE: mode, MERGED_ACTION: mergedAction ? '1' : '0', CHECK_TIMEOUT_SECONDS: String(timeoutSeconds), EXPECTED_CHECKS: expected,
+      MOCK_CASE: mode, CHECK_TIMEOUT_SECONDS: String(timeoutSeconds), EXPECTED_CHECKS: expected,
       TINES_API_URL: 'https://example.test', TINES_API_KEY: 'fake' },
     encoding: 'utf8', timeout: 10_000,
   });
@@ -326,31 +325,22 @@ test('concurrent issue state change prevents transition', async () => {
 
 for (const mode of ['merged', 'merge_after_checks', 'merge_pending','merge_final_sleep','merge_final_watch','merge_check_error']) {
   test(mode + ' records real merge evidence without claiming checks passed', async () => {
-    const {result, report, events} = await simulate(mode, {mergedAction:true});
+    const {result, report, events} = await simulate(mode);
     assert.equal(result.status, 0, result.stderr);
     assert.equal(report.result, 'merged');
-    assert.equal(report.reason, 'already_merged');
+    assert.equal(report.reason, 'already_merged_needs_reconciliation');
     assert.equal(report.merge.commit_sha, 'c'.repeat(40));
     assert.equal(report.merge.merged_at, '2026-10-31T04:00:00Z');
     assert.equal(report.summary, null);
     assert.deepEqual(report.checks, []);
-    assert.equal(events.find(e=>e.binary==='tines'&&e.args[1]==='move').args[3], 'Merged');
-    assert.match(events.find(e=>e.binary==='tines'&&e.args[1]==='comment').args[3], /already merged.*No check-pass result is inferred/);
+    assert.equal(events.find(e=>e.binary==='tines'&&e.args[1]==='move').args[3], 'Infrastructure failed');
+    assert.match(events.find(e=>e.binary==='tines'&&e.args[1]==='comment').args[3], /already merged.*Manual workflow reconciliation.*not a CI failure.*no check-pass result is inferred/);
     if(mode==='merged') assert.ok(!events.some(e=>e.binary==='gh'&&e.args[1]==='checks'));
   });
 }
-test('merged without explicit completion action requests reconciliation, not infrastructure failure', async()=>{
- const {result,report,events}=await simulate('merged');
- assert.equal(result.status,1);
- assert.equal(report.result,'merged');
- assert.match(result.stderr,/explicit Merged transition/);
- assert.ok(events.some(e=>e.binary==='tines'&&e.args[2]==='attach'));
- assert.match(events.find(e=>e.binary==='tines'&&e.args[1]==='comment').args[3],/Manual workflow reconciliation/);
- assert.ok(!events.some(e=>e.binary==='tines'&&e.args[1]==='move'));
-});
 for(const [mode,reason] of [['merged_no_evidence','merge_evidence_missing'],['merged_changed_artifact','pr_artifact_changed']]) {
  test(mode+' never completes the issue',async()=>{
-  const {result,report,events}=await simulate(mode,{mergedAction:true});
+  const {result,report,events}=await simulate(mode);
   assert.equal(result.status,0,result.stderr);
   assert.equal(report.result,'infrastructure_failed');
   assert.equal(report.reason,reason);
